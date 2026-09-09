@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Plain rootless-style path: roothide's dpkg trigger rewrites this to the
+	     jbroot-absolute path at install time (confirmed pattern, see
+	     re.frida.server.plist: Program becomes jbroot-absolute, ProgramArguments[0]
+	     stays plain, and a __Patched marker is added). -->
+	<key>Program</key>
+	<string>/usr/local/bin/aaoracled</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/aaoracled</string>
+	</array>
+	<key>Label</key>
+	<string>xyz.regulad.aaoracled</string>
+	<key>UserName</key>
+	<string>mobile</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>/tmp/aaoracled.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/aaoracled.log</string>
+</dict>
+</plist>

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>67QDNMUGFA.xyz.regulad.oracled.appone</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>67QDNMUGFA</string>
+	<!-- Classic App Attest only (Row A baseline). Value must be a member of the
+	     profile's allowed array [development, production]; we pick development. -->
+	<key>com.apple.developer.devicecheck.appattest-environment</key>
+	<string>development</string>
+	<!-- get-task-allow lets Frida attach for the M3 oracle (development signing). -->
+	<key>get-task-allow</key>
+	<true/>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>67QDNMUGFA.*</string>
+	</array>
+</dict>
+</plist>

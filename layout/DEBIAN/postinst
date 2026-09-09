@@ -1,0 +1,16 @@
+#!/bin/sh
+# - sandyd: re-read the libSandy profiles we just installed (it caches them at
+#   launch) so the OracledDCPatch grant is actually live, not just present on
+#   disk.
+# - devicecheckd: on-demand XPC daemon (launchd relaunches it on next use);
+#   kill it so the next App Attest call picks up the freshly-injected tweak.
+# - aaoracled: (re)load the LaunchDaemon so it's live immediately after
+#   install/upgrade, without waiting for a reboot.
+if [ "$1" = "configure" ] || [ "$1" = "install" ] || [ "$1" = "upgrade" ]; then
+    launchctl kickstart -k system/com.opa334.sandyd >/dev/null 2>&1 || true
+    killall -9 devicecheckd >/dev/null 2>&1 || true
+    launchctl unload /Library/LaunchDaemons/xyz.regulad.aaoracled.plist >/dev/null 2>&1 || true
+    launchctl load /Library/LaunchDaemons/xyz.regulad.aaoracled.plist >/dev/null 2>&1 || true
+fi
+
+exit 0

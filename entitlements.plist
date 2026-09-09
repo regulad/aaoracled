@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Deliberately NO application-identifier / team-identifier /
+	     keychain-access-groups here. This binary never claims a fixed
+	     identity of its own — every identity aaoracled presents is chosen
+	     per-request at runtime via the forge file (see OracledDCCommon.h /
+	     Tweak.x), which the companion devicecheckd tweak honors regardless
+	     of what (if anything) this process's own entitlements claim. An
+	     earlier revision of this file hardcoded App A's real, genuinely
+	     provisioned application-identifier here — vestigial from before the
+	     runtime forge mechanism existed, unused by the current architecture
+	     (confirmed: identity forgery now happens entirely inside
+	     devicecheckd via LSBundleRecord hooking, not by anything read off
+	     this process's own audit token), and worth not carrying forward
+	     since embedding a real app's exact identifier into this ad-hoc
+	     binary cuts against the project's own rule of never borrowing a
+	     real app's identity in any capacity.
+	     appattest-environment IS still load-bearing: devicecheckd reads
+	     this specific entitlement (only this one) directly off the caller's
+	     real, unforgeable SecTask to decide dev-vs-prod support at all,
+	     separately from which App ID it ultimately presents. -->
+	<key>com.apple.developer.devicecheck.appattest-environment</key>
+	<string>development</string>
+	<key>get-task-allow</key>
+	<true/>
+
+	<!-- Required by roothide or a standalone (non-app-bundle) binary is killed
+	     at launch / runs sandboxed-containerized: its file writes land in a
+	     private container and dyld is denied access to jbroot libraries. See
+	     ~/repositories/geoshim/cli/entitlements.plist for the prior-art source
+	     of this exact set.
+	     NOTE (2026-09-07): platform-application deliberately OMITTED here —
+	     hypothesis under test: DCAppAttestService.isSupported returns NO for
+	     platform binaries (App Attest is a third-party-app proof; a platform
+	     binary already has full system trust and isn't a sensible caller). -->
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.private.security.storage.AppBundles</key>
+	<true/>
+	<key>com.apple.private.security.storage.AppDataContainers</key>
+	<true/>
+</dict>
+</plist>

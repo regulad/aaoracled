@@ -1,0 +1,21 @@
+# Codesigning key material, provisioning profiles, certs — never commit.
+artifacts/
+
+# Claude Code local session/config — leave untracked
+.claude/
+
+# harness runtime state / debug dump
+fixtures/harness/last_assertion.json
+fixtures/harness/keys_state.json
+
+# theos build output
+.theos/
+packages/
+fixtures/appa/.theos/
+fixtures/appa/build/
+
+# Local build / env noise
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Filter</key>
+  <dict>
+    <!-- devicecheckd is the sole target: it's the daemon behind
+         DCAppAttestService that binds App Attest identity (App ID / rpIdHash)
+         to the calling process. We patch its DCClientHandler so identity is
+         accepted from a caller-supplied file instead of derived exclusively
+         from the caller's code-signing legitimacy - the core of the Oracled
+         thesis: the SEP-level guarantee (genuine key, genuine
+         hardware) is real and untouched; app-identity legitimacy is an
+         OS/daemon-level policy a jailbreak can simply remove. -->
+    <key>Executables</key>
+    <array>
+      <string>devicecheckd</string>
+    </array>
+  </dict>
+</dict>
+</plist>

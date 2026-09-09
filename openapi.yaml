@@ -1,0 +1,337 @@
+openapi: 3.1.0
+info:
+  title: aaoracled
+  version: 0.1.0
+  summary: On-device App Attest oracle.
+  description: |
+    `aaoracled` runs **on the jailbroken device** and exposes a small REST API
+    that drives Apple's App Attest (`DCAppAttestService` -> `com.apple.devicecheckd`)
+    programmatically, outside any host app's UI/flow. It is the concrete
+    demonstration that on a compromised application processor, App Attest becomes
+    a callable signing service: the Secure Enclave still produces genuine,
+    Apple-signed attestations/assertions, but *which App ID* they are bound to is
+    driven by the caller (via a companion devicecheckd patch), not by a
+    legitimately provisioned app.
+
+    Threat model: the SEP is trusted; the entire AP (kernel, daemons, this
+    process, IPC) is attacker-controlled. `aaoracled` is that attacker-controlled
+    caller.
+
+    `/keys` is backed entirely by Apple's own device-wide App Attest keychain
+    namespace, not by anything `aaoracled` tracks itself: devicecheckd stores
+    every App Attest private key on the device — from every app — under one
+    shared keychain namespace with no per-app isolation visible to it, so a
+    compromised devicecheckd can list, sign with, and delete any of them, not
+    just ones `aaoracled` minted. This follows from the same AP-level
+    compromise described above, not a separate finding — the notable part is
+    that minting one *itself* works at all under a forged identity; that
+    every key is then reachable this way is a structural consequence of
+    where App Attest actually stores its keys.
+
+    Scope: only ever exercised against Parker's own Apple Developer Team ID
+    and App IDs Parker owns, plus the deliberate negative-control identities
+    of the M3.5 matrix (a never-registered bundle; a random fake team).
+    Attestations are inspected
+    only by a relying-party harness Parker controls — never sent to a third party.
+
+servers:
+  - url: http://127.0.0.1:8181
+    description: |
+      Device loopback (port 8181, distinct from the RP harness's 8080). Reached
+      from the researcher's laptop via an SSH forward tunnel
+      (`ssh -L 8181:127.0.0.1:8181 <device-alias>`) or consumed directly by an
+      on-device demo page.
+
+tags:
+  - name: keys
+    description: List, mint, sign with, and delete App Attest keys.
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness + environment probe.
+      tags: [keys]
+      responses:
+        "200":
+          description: aaoracled is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  appAttestSupported:
+                    type: boolean
+                    description: DCAppAttestService.isSupported on this device.
+                  defaultEnvironment:
+                    $ref: "#/components/schemas/Environment"
+                required: [ok, appAttestSupported]
+
+  /keys:
+    get:
+      operationId: listKeys
+      summary: List every App Attest key resident on the device.
+      description: |
+        Calls Apple's own `_getAllCredentialKeychainLabels` (AppAttestInternal,
+        resolved and called directly by address from inside the compromised
+        devicecheckd process) and returns every label found under the shared
+        `com.apple.appattest.identities` keychain service — one entry per
+        credential ever created by App Attest on this device, by any app, real
+        identity or forged, including ones this aaoracled instance itself
+        minted (there is no separate bookkeeping for those).
+
+        Keys are **opaque**: each label is built from SHA256 hashes of the
+        environment, per-installation app UUID, and team/bundle identifier
+        (`_buildKeychainLabel`, one-way), plus the raw credentialId and a
+        `p`/`d` environment-prefix character. There is no way to recover
+        which app a key belongs to from it alone — treat it as an opaque
+        handle, not identifying information.
+      tags: [keys]
+      responses:
+        "200":
+          description: Every key on the device.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items: { $ref: "#/components/schemas/Key" }
+                required: [keys]
+        "502":
+          description: The devicecheckd-side enumeration call failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+    post:
+      operationId: createKey
+      summary: Mint + attest a new key for a given App ID.
+      description: |
+        Generates a fresh Secure Enclave key and attests it over the supplied
+        `clientDataHash`, bound to the requested `appId`. This is the core oracle
+        primitive: `appId` is a **caller-chosen** input — the whole point of the
+        research is to observe whether devicecheckd/Apple issue a valid
+        attestation carrying that App ID's rpIdHash regardless of what this
+        process is legitimately provisioned for (the A-E matrix).
+
+        The response is a one-time snapshot of what was just minted — it is
+        not stored. The new key shows up in a subsequent `GET /keys` like any
+        other, addressed by its own opaque label, not by the `keyId` returned
+        here.
+
+        Each call mints a new key and performs one Apple attestation round trip
+        (rate-limit / risk_metric sensitive — mint deliberately).
+      tags: [keys]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateKeyRequest" }
+      responses:
+        "201":
+          description: Key minted and attested.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateKeyResponse" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          description: |
+            devicecheckd / Apple's attestation service rejected the request
+            (e.g. refused the requested App ID). The body reports the underlying
+            DCError. For the matrix, a rejection here is itself a result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /keys/{key}/sign:
+    post:
+      operationId: signWithKey
+      summary: Sign a challenge with an arbitrary key.
+      description: |
+        Resolves `key` to a live `SecKeyRef` via Apple's own
+        `_copy_keychain_item` (same address-resolution technique as
+        `listKeys`) and signs `clientDataHash` directly with
+        `SecKeyCreateSignature` (`kSecKeyAlgorithmECDSASignatureMessageX962SHA256`).
+
+        This returns a **raw ECDSA signature**, not an App Attest assertion —
+        there is no `authenticatorData`, no counter, and no CBOR wrapping,
+        because the normal `generateAssertion` bookkeeping (counter storage,
+        authenticator data construction) is keyed to a claimed app identity
+        this call never makes or needs. Works uniformly for any key `GET
+        /keys` lists, including ones this instance just minted.
+      tags: [keys]
+      parameters:
+        - name: key
+          in: path
+          required: true
+          description: |
+            A key exactly as returned by `GET /keys`, URL-encoded. Keys are
+            standard base64-derived and contain `:` plus, for most entries,
+            `+`/`/`/`=` — percent-encode the entire value before building the
+            URL (in particular, any `/` in the key MUST be encoded as `%2F`
+            or it will be parsed as a path separator).
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignRequest" }
+      responses:
+        "200":
+          description: Signature produced.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignResponse" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          description: No keychain item exists for that key, or signing failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /keys/{key}:
+    delete:
+      operationId: deleteKey
+      summary: Delete a key from the device.
+      description: |
+        Calls Apple's own `_deleteCredentialKeychainWithLabel` (same
+        address-resolution technique as `listKeys`), which removes the
+        keychain item for `key`.
+
+        This call is **idempotent by Apple's own design, not aaoracled's**:
+        confirmed live (a real device, a real key) that the underlying
+        function returns success both when the key existed and was actually
+        removed, and when it was already gone — Apple's own
+        `_delete_keychain_item` treats `SecItemDelete`'s real success and
+        `errSecItemNotFound` as equally successful outcomes. There is
+        therefore no reliable way to report "the key didn't exist" as a
+        distinct `404` here, and aaoracled does not fake one on top of it:
+        any `key` that isn't a genuine failure on Apple's side returns `200`
+        whether or not it was actually present beforehand.
+      tags: [keys]
+      parameters:
+        - name: key
+          in: path
+          required: true
+          description: >-
+            A key exactly as returned by `GET /keys`, URL-encoded (same
+            encoding rules as `POST /keys/{key}/sign`).
+          schema: { type: string }
+      responses:
+        "200":
+          description: Delete call succeeded (see idempotency note above).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeleteKeyResponse" }
+        "500":
+          description: The underlying delete call genuinely failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+  responses:
+    BadRequest:
+      description: Malformed request (bad base64, missing field, bad appId shape).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Environment:
+      type: string
+      enum: [development, production]
+      default: development
+      description: |
+        App Attest environment. Selects the AAGUID Apple stamps into authData
+        (`appattestdevelop` vs `appattest`).
+
+    AppId:
+      type: string
+      pattern: '^[A-Z0-9]{10}\.[A-Za-z0-9.\-]+$'
+      description: App ID as `<TeamID>.<BundleID>`, e.g. `ABCDE12345.com.example.myapp`.
+      examples: ["ABCDE12345.com.example.myapp"]
+
+    Base64:
+      type: string
+      contentEncoding: base64
+      description: Standard base64-encoded bytes.
+
+    Key:
+      type: string
+      description: >-
+        Opaque credential-keychain label from AppAttestInternal's own
+        namespace, verbatim (including its `aa:` prefix) — see `GET /keys`.
+      examples:
+        - "aa:9Ur1MdQmPZZbOLudX+0T2lAbouGfiPZH1GQOIRyp88Y=d:4VI0nln7iw2mu3QIYzOuKkK9973ltBVMr6Rra6VrfSU=:eoYNTZIaNEumvCYOW4JCGkUhl7iv/6HpXUuvbGt+Tk0=:rk"
+
+    CreateKeyRequest:
+      type: object
+      properties:
+        appId: { $ref: "#/components/schemas/AppId" }
+        environment: { $ref: "#/components/schemas/Environment" }
+        clientDataHash:
+          allOf: [{ $ref: "#/components/schemas/Base64" }]
+          description: |
+            The 32-byte SHA-256 hash the attestation is bound to (typically
+            `SHA256(server_challenge)`). The relying party computes this;
+            aaoracled passes it straight to `attestKey`.
+      required: [appId, clientDataHash]
+
+    CreateKeyResponse:
+      type: object
+      properties:
+        keyId:
+          allOf: [{ $ref: "#/components/schemas/Base64" }]
+          description: >-
+            The credentialId App Attest assigned this key, as returned by
+            `generateKey`/`attestKey` directly. NOT the same string as the
+            opaque label `GET /keys` returns for this same key — use that
+            label, from a subsequent listing, to sign or delete it later.
+        appId: { $ref: "#/components/schemas/AppId" }
+        environment: { $ref: "#/components/schemas/Environment" }
+        attestation:
+          allOf: [{ $ref: "#/components/schemas/Base64" }]
+          description: CBOR `apple-appattest` attestation object, base64-encoded.
+        counter: { type: integer, const: 0 }
+      required: [keyId, appId, environment, attestation, counter]
+
+    SignRequest:
+      type: object
+      properties:
+        clientDataHash:
+          allOf: [{ $ref: "#/components/schemas/Base64" }]
+          description: Arbitrary 32-byte hash to sign directly (no App Attest semantics).
+      required: [clientDataHash]
+
+    SignResponse:
+      type: object
+      properties:
+        key: { $ref: "#/components/schemas/Key" }
+        signature:
+          allOf: [{ $ref: "#/components/schemas/Base64" }]
+          description: >-
+            Raw DER-encoded ECDSA signature over `clientDataHash` — NOT a CBOR
+            App Attest assertion. See the endpoint description.
+      required: [key, signature]
+
+    DeleteKeyResponse:
+      type: object
+      properties:
+        key: { $ref: "#/components/schemas/Key" }
+        deleted:
+          type: boolean
+          const: true
+      required: [key, deleted]
+
+    Error:
+      type: object
+      properties:
+        error: { type: string, description: Short machine-readable code. }
+        detail: { type: string, description: Human-readable detail (e.g. DCError). }
+      required: [error]
