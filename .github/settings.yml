@@ -10,7 +10,7 @@ repository:
     driving DCAppAttestService directly outside any UI flow.
   homepage: ""
 
-  private: true
+  private: false
 
   # Topics: comma-and-space separated string, NOT a YAML list — the
   # Probot Settings schema takes `topics` as one string it splits itself.
