@@ -1,0 +1,123 @@
+# Build the combined aaoracled .deb (the OracledDCPatch tweak + the
+# aaoracled CLI/daemon) the way SETUP.md step 9 describes a Linux build:
+# roothide's theos fork, the prebuilt L1ghtmann iOS toolchain, and the
+# patched iPhoneOS 16.5 SDK that the Makefile's
+# `TARGET = iphone:clang:16.5:15.0` asks for. Packaging itself is delegated
+# to the repo's own build_and_sign.sh, so CI and a local build take the
+# same code path.
+#
+# This proves only that the project compiles and packages. It cannot
+# validate the result: Tweak.x hooks AppAttestInternal at hardcoded,
+# Ghidra-derived offsets that are valid for exactly one dyld_shared_cache
+# build (iPad mini 4, iPadOS 15.8.8 / 19H422), and nothing here touches a
+# device.
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # theos ships one SDK per iOS version; the Makefile targets 16.5.
+  SDK: iPhoneOS16.5
+  # Bump to force a cold rebuild of the cached theos install — both the
+  # toolchain and the SDK come from rolling "latest" releases.
+  THEOS_CACHE_VERSION: v1
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure theos location
+        # Outside the workspace, so actions/checkout's clean step never
+        # walks it and the cache restores independently of the checkout.
+        run: echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # The Debian set from roothide theos' own bin/install-theos, plus
+          # libtinfo6 (the non-Swift prebuilt toolchain links against it) and
+          # libplist-2.0-4 (FINALPACKAGE=1 runs theos' convert_xml_plist.sh,
+          # which calls the toolchain's dynamically linked plistutil).
+          sudo apt-get install -y --no-install-recommends \
+            build-essential fakeroot rsync curl perl zip git libxml2 \
+            libtinfo6 libplist-2.0-4 xz-utils dpkg-dev
+
+      - name: Cache theos (toolchain + SDK)
+        id: theos-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/theos
+          key: theos-${{ runner.os }}-${{ runner.arch }}-${{ env.SDK }}-${{ env.THEOS_CACHE_VERSION }}
+
+      - name: Install theos (roothide fork)
+        if: steps.theos-cache.outputs.cache-hit != 'true'
+        run: |
+          # The roothide fork is what provides THEOS_PACKAGE_SCHEME=roothide,
+          # which the Makefile exports; upstream theos cannot build this.
+          rm -rf "$THEOS"
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git "$THEOS"
+
+      - name: Install iOS toolchain
+        if: steps.theos-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$THEOS/toolchain"
+          curl -fsSL "https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-$(uname -m).tar.xz" \
+            | tar -xJf - -C "$THEOS/toolchain/"
+          test -x "$THEOS/toolchain/linux/iphone/bin/clang"
+          # build_and_sign.sh refuses to run without ldid on PATH, and puts
+          # this directory on it — the toolchain ships the binary.
+          test -x "$THEOS/toolchain/linux/iphone/bin/ldid"
+
+      - name: Install ${{ env.SDK }} SDK
+        if: steps.theos-cache.outputs.cache-hit != 'true'
+        env:
+          # install-sdk reads the release list off the GitHub API; auth
+          # keeps it clear of the unauthenticated rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          "$THEOS/bin/install-sdk" "$SDK"
+          test -d "$THEOS/sdks/$SDK.sdk"
+
+      - name: Build package
+        env:
+          # Release build, so the .deb carries the plain version from
+          # `control`. A debug build appends theos' auto-incrementing build
+          # counter, which is meaningless on an ephemeral runner.
+          FINALPACKAGE: "1"
+        run: ./build_and_sign.sh
+
+      - name: Inspect built package
+        run: |
+          DEB="$(find packages -maxdepth 1 -name '*.deb' | sort -V | tail -1)"
+          [ -n "$DEB" ] || { echo "::error::no .deb was produced"; exit 1; }
+          echo "::notice::built $(basename "$DEB")"
+          # theos packages with dpkg-deb when it is installed and falls back
+          # to its own dm.pl otherwise; dm.pl emits data.tar.lzma, which
+          # current dpkg-deb cannot read, so degrade to `ar` rather than
+          # failing the build over the smoke check.
+          if ! { dpkg-deb -I "$DEB" && dpkg-deb -c "$DEB"; }; then
+            echo "::warning::dpkg-deb could not read the package; listing members instead"
+            ar t "$DEB"
+          fi
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: aaoracled-deb
+          path: packages/*.deb
+          if-no-files-found: error
