@@ -3,11 +3,15 @@
 Daemon that enables an iOS/iPadOS device to be used as a sockpuppet/oracle
 that passes App Attest challenges on behalf of other devices.
 
-Created by [Parker Wahle](https://github.com/regulad)
-([hire me!](mailto:pw@regulad.xyz)). Anthropic's Claude "5" series models
+Created by [Parker Wahle](https://github.com/regulad). Anthropic's Claude 5 series models
 (Fable, Opus, Sonnet & Haiku) were used to rapidly iterate.
 
 ## Install
+
+You can either build `aaoracled` yourself or add my Cydia repo `https://ios.regulad.xyz`
+to your package manager and install `xyz.regulad.aaoracled`.
+
+## Building
 
 `aaoracled` ships as a single Debian package (`xyz.regulad.aaoracled`)
 containing both the `OracledDCPatch` tweak (injected into `devicecheckd`)
@@ -60,7 +64,7 @@ curl -s -X POST http://127.0.0.1:8181/keys \
 ```
 
 List every App Attest key resident on the device (not just ones `aaoracled`
-itself minted — see Threat Mitigation below):
+itself minted — see Vulnerability & Mitigation below):
 
 ```bash
 curl -s http://127.0.0.1:8181/keys
@@ -85,7 +89,7 @@ Delete a key from the device permanently:
 curl -s -X DELETE "http://127.0.0.1:8181/keys/$ENC"
 ```
 
-## Threat Mitigation
+## Vulnerability & Mitigation
 
 Apple's [App Attest](https://developer.apple.com/documentation/devicecheck/establishing-your-app-s-integrity)
 service can be used to prove that a request has been sanctioned by a
@@ -102,6 +106,28 @@ own marketing of App Attest, which does not clearly disclose that App
 Attest is not fully qualified to attest to the integrity of a non-secure
 environment.
 
+`aaoracled` makes that shortfall concrete. It mints App Attest keys for
+App IDs that the device it runs on could never run legitimately, turning
+an old, jailbroken device into a sockpuppet that forges attestations for
+apps that would otherwise require current hardware. Paired with an iOS
+simulator or a stripped-down app runtime, a request attested by
+`aaoracled` is indistinguishable from one emitted by a genuine, up-to-date
+device: App Attest keys carry no device-specific metadata — no OS version
+and no hardware model string — so a publisher cannot tell which device or
+OS release minted a key. That gap matters because publishers routinely
+raise the minimum OS version of their apps to keep unpatched or
+known-compromised devices out, and an attestation minted below that floor
+sails straight past the check. Apple *can* close it: it could refuse to
+sign certificate requests emitted by `com.apple.devicecheckd` when the
+SEP-backed key came from a device whose maximum supported iOS is lower
+than the minimum iOS of the App ID named in the request. As of
+publication, Apple's App Attest CSR-signing infrastructure performs no
+such check and will sign any request carrying a well-formed App ID. The OS
+floor is only the most legible casualty of a more general limit: what an
+App Attest assertion actually proves is that a genuine Secure Enclave
+exists somewhere behind the request — not which device holds it, not what
+that device is running, and not what software asked it to sign.
+
 If you are developing an app that needs to enforce the integrity of its
 operating environment, please note the following when using App Attest:
 
@@ -117,33 +143,9 @@ operating environment, please note the following when using App Attest:
    client-side restriction can be bypassed; anything life-or-death *must*
    be enforced server-side!**
 
-While this project targets iOS, the underlying architectural pattern it
-demonstrates isn't inherently iOS-specific. This project's specific exploit
-chain relies on checkm8, a permanent bootROM exploit that runs before any
-OS-level code — including Apple's own Secure Boot chain — which has no real
-Android equivalent, since Android Verified Boot (AVB) measures the boot
-chain into a hardware root of trust starting from the very first stage.
-Compromising a verified-boot Android device generally means either
-unlocking the bootloader outright (which AVB and remote attestation are
-explicitly designed to detect and report) or finding a runtime exploit that
-leaves the measured boot chain untouched.
-
-That distinction matters for *how* a device would need to be compromised,
-but not necessarily for *whether* the underlying gap exists at all. The
-real question this project's finding raises is architectural, not
-Apple-specific: is the userspace code brokering between the OS and the
-secure hardware independently checked by that hardware, or does the
-hardware simply sign whatever identity claim userspace hands it? If
-Android's own attestation stack (Keystore key attestation, and the Play
-Integrity API built on top of it) has a similarly-shaped userspace daemon
-deriving app identity without an independent check from its own secure
-element (a TEE, or a dedicated StrongBox module analogous to Apple's Secure
-Enclave), then a sufficiently privileged, post-boot userspace compromise —
-one that leaves verified boot's own measurements intact — could in
-principle abuse the same class of gap. This project did not attempt this
-against any Android device or attestation stack, so this is a hypothesis
-about a shared architectural failure mode, not a claim about Android's
-actual security — a direction for further research, not a finding.
+This issue was privately disclosed to Apple as Security Research
+submission #OE1107928141015. The submission was allowed to close before
+the publication of this research tool.
 
 ## License
 
