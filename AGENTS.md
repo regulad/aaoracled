@@ -31,6 +31,58 @@ Developer credentials involved. This is not adversarial tooling aimed at a
 third party. If anything significant is found, it will be responsibly
 disclosed to Apple before any public presentation of this work.
 
+## End goal — a framework-shaped contract
+
+The REST surface in `openapi.yaml` is not an arbitrary convenience API. The
+target shape is **functional equivalence with the calls Apple's
+`DeviceCheck.framework` makes on an app's behalf**, so that a *stub*
+`DeviceCheck.framework` — one that forwards every call to `aaoracled` over
+HTTP instead of XPC-ing to a real `devicecheckd` — can be substituted into a
+research target. That substitution is what lets a research target run on an
+**iPhone Simulator**, which has no Secure Enclave and where
+`DCAppAttestService.isSupported` is `NO`: the simulator-hosted app calls the
+stub, the stub calls this daemon, and the attestation is minted by the real
+SEP on the jailbroken device. That is the point of the entire project.
+
+**Building that stub framework is OUT OF SCOPE for this repository.** What is
+in scope — and what every contract decision should be measured against — is
+making `openapi.yaml` *sufficient* for someone else to build one. A contract
+change is on-target when it moves the API toward one-to-one coverage of the
+framework's public surface; it is off-target when it adds a convenience shape
+that only `curl` would ever want.
+
+The surface a stub has to satisfy, taken from `DeviceCheck.framework`'s own
+SDK headers and `.tbd` (see "Reading the DeviceCheck SDK surface" below):
+
+| Framework entry point | Must map to |
+|---|---|
+| `DCAppAttestService.sharedService` | nothing — no server-side state |
+| `-isSupported` | a capability answer |
+| `-generateKeyWithCompletionHandler:` | mint only, returning the keyId |
+| `-attestKey:clientDataHash:completionHandler:` | attest an **already-minted** keyId |
+| `-generateAssertion:clientDataHash:completionHandler:` | a genuine CBOR assertion, counter managed daemon-side |
+| `DCDevice -generateTokenWithCompletionHandler:` | not App Attest; currently unimplemented |
+| `DCErrorDomain` + its five codes | a documented error mapping |
+
+Two consequences, stated outright because they overrule local convenience:
+
+1. **`generateKey` and `attestKey` must be independently callable.** Apple's
+   own documented flow separates them — the app persists the keyId and attests
+   later — and `DCAppAttestService.h` explicitly instructs that on
+   `DCErrorServerUnavailable` you retry "using the same key and client data
+   hash later ... Retrying with the same inputs helps to preserve the risk
+   metric for a given device." A fused mint-and-attest endpoint cannot express
+   that, so it cannot back a faithful stub. Note the corollary: because the
+   keyId is `base64(SHA256(public key))` and is returned by the mint call, a
+   caller that wants `clientDataHash = SHA256(keyId)` computes it itself once
+   the two calls are split — no daemon-side derivation needed.
+2. **The App ID is an explicit parameter wherever the framework would have
+   derived it from the calling process.** That derivation is exactly what
+   `Tweak.x` forges, and a stub has no legitimate identity to derive from, so
+   every call that binds identity has to carry it over the wire — the
+   environment at `generateKey`, the rpIdHash and AAGUID at `attestKey`, and
+   the rpIdHash in an assertion's authData.
+
 ## Scope constraints
 
 1. **Only ever attest against an Apple Developer Team ID you are
@@ -313,6 +365,57 @@ surface for any environment work — one request, no CA involvement.
   issued yourself. Confirm liveness via an actual `/health` curl or a live
   Frida `enumerate_processes()` check. Check status *before* issuing a new
   kickstart if you need the process's own real prior exit reason.
+
+## Reading the DeviceCheck SDK surface (no device, no Ghidra)
+
+The *public* API a stub has to satisfy is answerable entirely from the theos
+SDK — no device, no disassembly. On the WSL instance `regulad-fedora`:
+
+```
+/home/regulad.linux/theos/sdks/iPhoneOS16.5.sdk/System/Library/Frameworks/DeviceCheck.framework
+```
+
+Two mechanical gotchas: `$THEOS` is not exported in a non-interactive shell,
+and PowerShell mangles nested quotes passed through
+`wsl -d regulad-fedora -- bash -lc`. Use absolute paths with no shell
+variables.
+
+The SDK ships `.tbd` stubs and headers, **not** Mach-O binaries — there is
+nothing there to disassemble, and nothing needs to be:
+
+- `Headers/DCAppAttestService.h`, `DCDevice.h`, `DCError.h` are the complete
+  public interface, with Apple's own documentation comments inline. They are
+  authoritative for call shapes, parameter semantics (`clientDataHash` is "a
+  SHA256 hash of a unique, single-use data block" on *both* `attestKey` and
+  `generateAssertion`, i.e. 32 bytes at the public API), and for exactly which
+  error each failure produces.
+- `DeviceCheck.tbd` is the complete export list:
+  - error domains: `_DCErrorDomain`, `_DCBAASignerErrorDomain`
+  - ObjC classes: `DCAppAttestService`, `DCContext`, `DCDevice`,
+    `DCDeviceMetadataDaemonConnection`, `DCDeviceMetadataInterface`
+
+Note the asymmetry: **five** classes and **two** error domains are exported
+from the binary, but only `DCAppAttestService`, `DCDevice` and `DCErrorDomain`
+are declared in headers. `DCContext`,
+`DCDeviceMetadataDaemonConnection`, `DCDeviceMetadataInterface` and
+`_DCBAASignerErrorDomain` are linkable but undeclared. A stub needs only the
+public two if its research target sticks to public API; characterizing the
+other three means pulling the real binary out of the device's dyld shared
+cache via the Ghidra workflow below, since the SDK carries no code for them.
+
+`DCError` is an `NS_ERROR_ENUM`, so the five codes are implicitly 0-based in
+declaration order: `DCErrorUnknownSystemFailure` 0,
+`DCErrorFeatureUnsupported` 1, `DCErrorInvalidInput` 2, `DCErrorInvalidKey` 3,
+`DCErrorServerUnavailable` 4. `DCErrorInvalidKey` is the documented result of
+attesting an already-attested key *and* of asserting with an unattested one —
+both of which this daemon can now provoke, so both need to be distinguishable
+in its error responses.
+
+Only `iPhoneOS16.5.sdk` and `AppleTVOS12.4.sdk` are installed. 16.5 being
+newer than the reference device's 15.8.8 does not matter here: the whole App
+Attest surface is `API_AVAILABLE(ios(14.0))` and unchanged across both, and
+Swift's `async` variants are compiler-synthesized from the completion-handler
+methods, so they add no symbol a stub must export.
 
 ## Finding and validating offsets (Ghidra workflow)
 
