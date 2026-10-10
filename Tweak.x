@@ -619,6 +619,24 @@ static void OracledHandleListSEKeys(id completion) {
     block(json, jsonErr);
 }
 
+// UNUSED FROM THE DAEMON as of 0.3.0 — nothing in `aaoracled` reaches this.
+//
+// The `POST /keys/{key}/sign` route that drove it was removed:
+// `POST /keys/{keyId}/assert` produces a genuine App Attest assertion with
+// devicecheckd's own counter, which is both correct and what a stub
+// DeviceCheck.framework needs, whereas this produces a bare ECDSA signature
+// over arbitrary bytes with no identity and no counter.
+//
+// Kept deliberately, not left behind by accident. That a compromised
+// devicecheckd can sign with ANY credential resident on the device — every
+// app's, not just ones this tool minted — is a finding in its own right, and
+// this function is the evidence for it. Deleting the code would delete the
+// demonstration.
+//
+// It is still reachable over the sentinel channel by anything that can send
+// the `kOracledRawLabelSignPrefix` keyId (see the dispatch below), so it is
+// dead code only with respect to `oracled.m`. Don't re-expose it over HTTP
+// without a reason `assert` cannot serve.
 static void OracledHandleSignArbitraryKey(NSString *label, NSData *clientDataHash, id completion) {
     void (^block)(id, id) = completion;
 
@@ -730,6 +748,10 @@ static void OracledHandleDeleteArbitraryKey(NSString *label, id completion) {
             OracledHandleListSEKeys(completion);
             return;
         }
+        // UNUSED FROM THE DAEMON as of 0.3.0: `aaoracled` never sends this
+        // sentinel any more. The HTTP route that did (POST /keys/{key}/sign)
+        // was removed in favour of POST /keys/{keyId}/assert. Kept on
+        // purpose — see the note above OracledHandleSignArbitraryKey.
         if ([(NSString *)keyId hasPrefix:kOracledRawLabelSignPrefix]) {
             NSString *label = [(NSString *)keyId substringFromIndex:kOracledRawLabelSignPrefix.length];
             NSLog(@"[OracledDCPatch] intercepted Assert: signing with arbitrary raw label=%@", label);

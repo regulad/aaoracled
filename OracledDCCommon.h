@@ -73,6 +73,10 @@ static NSString *const kOracledForgeKeyEnvironment = @"environment";
 // separately) after the forge-path duplication bug from earlier this
 // session — one spelling, used by both sides.
 static NSString *const kOracledListSEKeysSentinel = @"__oracled_list_se_keys__";
+// No caller in oracled.m as of 0.3.0 — POST /keys/{key}/sign was removed in
+// favour of POST /keys/{keyId}/assert, which yields a genuine assertion with
+// devicecheckd's counter. The tweak-side handler is kept deliberately; see
+// the note above OracledHandleSignArbitraryKey in Tweak.x.
 static NSString *const kOracledRawLabelSignPrefix = @"__oracled_sign_raw_label__:";
 static NSString *const kOracledRawLabelDeletePrefix = @"__oracled_delete_raw_label__:";
 
