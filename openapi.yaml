@@ -61,9 +61,6 @@ paths:
                 type: object
                 properties:
                   ok: { type: boolean }
-                  appAttestSupported:
-                    type: boolean
-                    description: DCAppAttestService.isSupported on this device.
                   supportedEnvironments:
                     type: array
                     items: { $ref: "#/components/schemas/Environment" }
@@ -79,7 +76,17 @@ paths:
                       Whether the injected tweak can override devicecheckd's
                       environment decision. False means `environment` on
                       `POST /keys` is accepted but cannot be enforced.
-                required: [ok, appAttestSupported]
+                required: [ok]
+      description: |
+        Liveness and what this daemon can honor.
+
+        `appAttestSupported` was removed in 0.3.0 and is **not** coming back.
+        `DCAppAttestService.isSupported` answers for *this* process, which is
+        a bare binary with no installed app bundle, so LaunchServices has no
+        record for it and the answer is `NO` — while mint, attest and assert
+        all work, because the forge supplies the identity devicecheckd
+        actually evaluates. Reporting a `NO` alongside a working oracle read
+        as "App Attest is unavailable here", which was simply false.
 
   /keys:
     get:
@@ -273,6 +280,77 @@ paths:
             already-attested key, but see the operation description: that is
             not the behaviour measured here, and re-attest is treated as
             undefined rather than as a reliable error.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /keys/{keyId}/assert:
+    post:
+      operationId: assertKey
+      summary: Produce a real App Attest assertion with an attested key.
+      description: |
+        Calls `generateAssertion:clientDataHash:completionHandler:` and returns
+        the CBOR assertion object — `{signature, authenticatorData}` — that a
+        relying party expects for every post-registration request.
+
+        **This is not `POST /keys/{key}/sign`.** Here devicecheckd builds
+        `authData` itself (the rpIdHash plus its own monotonically
+        incrementing counter for the key) and the Secure Enclave signs over
+        `authData || clientDataHash`. `/sign` is a deliberately lower-level
+        primitive: a raw ECDSA signature over whatever bytes the caller hands
+        it, bypassing identity and the counter entirely.
+
+        That difference is why this operation has to exist. A stub
+        `DeviceCheck.framework` cannot assemble an assertion out of `/sign`,
+        because the counter is devicecheckd's state and nothing outside it
+        knows the current value — inventing one desynchronises every other
+        holder of the key and breaks a relying party's counter-increased
+        check.
+
+        The key must already be attested. Apple documents
+        `DCErrorInvalidKey` for asserting with an unattested key.
+
+        As with attest: `appId` is required only because this process has no
+        identity for devicecheckd to derive, there is deliberately no
+        `environment` field, and passing an `appId` other than the one the key
+        was created under is **undefined behaviour**.
+
+        The counter is not echoed in the response. It lives inside
+        `authenticatorData`, which the caller must parse anyway, and
+        devicecheckd owns the value — a second-hand copy would invite
+        treating it as authoritative.
+      tags: [keys]
+      parameters:
+        - name: keyId
+          in: path
+          required: true
+          description: >-
+            The `keyId` from `POST /keys`, percent-encoded (`/` must become
+            `%2F`). Not the opaque keychain label — see the attest operation.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AssertRequest" }
+      responses:
+        "200":
+          description: Assertion produced.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AssertResponse" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: No credential on this device matches that `keyId`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: |
+            devicecheckd refused. Most likely `DCErrorInvalidKey` — the key
+            exists but has never been attested, which is the documented error
+            for asserting with an unattested key.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -513,6 +591,42 @@ components:
           description: CBOR `apple-appattest` attestation object, base64-encoded.
         counter: { type: integer, const: 0 }
       required: [keyId, appId, environment, attestation, counter]
+
+    AssertRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        appId:
+          allOf: [{ $ref: "#/components/schemas/AppId" }]
+          description: >-
+            Must be the App ID the key was created under; anything else is
+            undefined behaviour. Required only because this process has no
+            identity of its own for devicecheckd to derive.
+        clientDataHash:
+          allOf: [{ $ref: "#/components/schemas/Base64" }]
+          description: >-
+            Exactly 32 bytes — a SHA-256 digest, per
+            `DCAppAttestService.h` ("A SHA256 hash of a unique, single-use
+            data block"). devicecheckd composes the signed message around it
+            rather than signing it directly, which is why this is fixed-length
+            where `POST /keys/{key}/sign` accepts 1..4096.
+      required: [appId, clientDataHash]
+
+    AssertResponse:
+      type: object
+      properties:
+        keyId: { $ref: "#/components/schemas/Base64" }
+        appId: { $ref: "#/components/schemas/AppId" }
+        environment:
+          allOf: [{ $ref: "#/components/schemas/Environment" }]
+          description: Read back from the credential's keychain label.
+        assertion:
+          allOf: [{ $ref: "#/components/schemas/Base64" }]
+          description: >-
+            CBOR assertion object — a map of `signature` and
+            `authenticatorData`, base64-encoded. The counter is inside
+            `authenticatorData`.
+      required: [keyId, appId, environment, assertion]
 
     SignRequest:
       type: object

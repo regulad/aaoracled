@@ -31,12 +31,17 @@
 
 static const int kPort = 8181;
 
-// Private SPI (confirmed present via M3 Frida recon on DCAppAttestService) —
-// gives the actual NSError behind `isSupported == NO`, which the public API
-// swallows.
-@interface DCAppAttestService (OraclePrivate)
-- (BOOL)_isSupportedReturningError:(NSError **)error;
-@end
+// `isSupported` is deliberately NOT reported or consulted anywhere here.
+//
+// It answers for THIS process, and this process is a bare binary with no
+// installed app bundle, so LaunchServices has no record for it and the answer
+// is NO. Meanwhile every operation below works: mint, attest and assert all
+// succeed, because the forge gives devicecheckd the identity it actually
+// evaluates. Reporting a NO that coexists with a working oracle was worse
+// than reporting nothing — it read as "App Attest is unavailable" when the
+// truth is "this process has no identity of its own, which is the point."
+// The private `_isSupportedReturningError:` SPI that used to surface the
+// underlying NSError went with it.
 
 // aaoracled has no fixed App ID of its own — the whole point is that it
 // forges whatever App ID the caller of POST /keys asks for (see Tweak.x).
@@ -368,6 +373,66 @@ static Resp handleAttestKey(NSString *keyId, NSDictionary *body) {
                     @"attestation": b64e(att), @"counter": @0});
 }
 
+// POST /keys/{keyId}/assert — generateAssertion on an attested key.
+//
+// This is the real framework operation, and it is NOT the same thing as
+// POST /keys/{key}/sign. Here devicecheckd builds authData itself (rpIdHash
+// plus its own monotonically incrementing counter for the key) and the SEP
+// signs over authData || clientDataHash, yielding the CBOR
+// {signature, authenticatorData} a relying party expects. /sign is a
+// deliberately lower-level primitive: a raw ECDSA signature over whatever
+// bytes the caller hands it, bypassing identity and the counter entirely.
+//
+// A stub DeviceCheck.framework cannot build an assertion out of /sign,
+// because the counter is devicecheckd's state and nothing outside it knows
+// the current value. Inventing one desynchronises every other holder of the
+// key and breaks a relying party's counter-increased check. Hence this route.
+//
+// Needs the forge armed, unlike /sign: the rpIdHash baked into authData comes
+// from whatever caller identity devicecheckd resolves at call time.
+//
+// Same UB caveat as attest: `appId` must match the App ID the key was created
+// under.
+static Resp handleAssertKey(NSString *keyId, NSDictionary *body) {
+    NSString *unknown = unknownFields(body, @[@"appId", @"clientDataHash"]);
+    if (unknown)
+        return Err(400, @"unknown_field",
+                   [NSString stringWithFormat:@"POST /keys/{keyId}/assert does not "
+                    @"accept: %@. The environment is read from the key's own "
+                    @"keychain label, not supplied.", unknown]);
+    id cdhIn = body[@"clientDataHash"];
+    NSString *appId = body[@"appId"];
+    NSData *cdh = [cdhIn isKindOfClass:NSString.class] ? b64d(cdhIn) : nil;
+    if (keyId.length == 0)
+        return Err(400, @"bad_request", @"keyId required in path (from POST /keys)");
+    if (![appId isKindOfClass:NSString.class])
+        return Err(400, @"bad_request", @"appId required");
+    // Exactly 32 bytes, unlike /sign. generateAssertion's clientDataHash is a
+    // SHA-256 digest by contract (DCAppAttestService.h: "A SHA256 hash of a
+    // unique, single-use data block"), and devicecheckd composes the message
+    // around it rather than signing it directly.
+    if (cdh.length != 32)
+        return Err(400, @"bad_request", @"clientDataHash must be 32 bytes (base64)");
+
+    NSString *label = labelForKeyId(keyId);
+    if (!label)
+        return Err(404, @"unknown_key", @"no credential on this device matches that keyId");
+    NSString *env = environmentFromLabel(label);
+    if (!env) return Err(502, @"unknown_label_shape", label);
+
+    setForgeAppId(appId, env);
+    NSError *err = nil;
+    NSData *asrt = dcAssert(keyId, cdh, &err);
+    clearForgeAppId();
+    if (!asrt) return Err(502, @"generateAssertion_failed", fullErrorDump(err));
+
+    // No counter echoed: it lives inside authenticatorData, which the caller
+    // has to parse anyway, and devicecheckd owns the value. Reporting a
+    // second-hand copy would invite treating it as authoritative.
+    return R(200, @{@"keyId": keyId, @"appId": appId, @"environment": env,
+                    @"assertion": b64e(asrt)});
+}
+
 static Resp handleSignKey(NSString *key, NSDictionary *body) {
     NSString *unknown = unknownFields(body, @[@"clientDataHash"]);
     if (unknown)
@@ -417,19 +482,19 @@ static Resp handleDeleteKey(NSString *key) {
 
 static Resp route(NSString *method, NSString *path, NSDictionary *body) {
     if ([path isEqualToString:@"/health"] && [method isEqualToString:@"GET"]) {
-        NSError *supErr = nil;
-        BOOL supported = [svc() _isSupportedReturningError:&supErr];
         // `defaultEnvironment: "development"` used to be hardcoded here. It
         // was right only by accident, and it is now the wrong concept
         // outright: the environment is chosen per call by devicecheckd (from
         // the caller's bundle record, or its entitlement when there is no
         // record), and POST /keys can force either one. There is no default
         // to report, so report what can actually be honored instead.
-        NSMutableDictionary *r = [@{@"ok": @YES, @"appAttestSupported": @(supported),
-                                     @"supportedEnvironments": @[@"development", @"production"],
-                                     @"environmentForgery": @YES} mutableCopy];
-        if (supErr) r[@"appAttestUnsupportedReason"] = fullErrorDump(supErr);
-        return R(200, r);
+        //
+        // `appAttestSupported` used to be here too and is gone — see the note
+        // at the top of this file for why reporting it was actively
+        // misleading.
+        return R(200, @{@"ok": @YES,
+                        @"supportedEnvironments": @[@"development", @"production"],
+                        @"environmentForgery": @YES});
     }
     if ([path isEqualToString:@"/keys"] && [method isEqualToString:@"GET"])
         return handleListKeys();
@@ -448,6 +513,11 @@ static Resp route(NSString *method, NSString *path, NSDictionary *body) {
     if ([path hasPrefix:@"/keys/"] && [path hasSuffix:@"/attest"] && [method isEqualToString:@"POST"]) {
         NSString *mid = [path substringWithRange:NSMakeRange(6, path.length - 6 - 7)];
         return handleAttestKey([mid stringByRemovingPercentEncoding], body);
+    }
+    // Also keyId-addressed, same namespace caveat as /attest above.
+    if ([path hasPrefix:@"/keys/"] && [path hasSuffix:@"/assert"] && [method isEqualToString:@"POST"]) {
+        NSString *mid = [path substringWithRange:NSMakeRange(6, path.length - 6 - 7)];
+        return handleAssertKey([mid stringByRemovingPercentEncoding], body);
     }
     if ([path hasPrefix:@"/keys/"] && [method isEqualToString:@"DELETE"]) {
         NSString *key = [path substringFromIndex:6];
@@ -542,7 +612,11 @@ static void serve(void) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        if (!svc().isSupported) NSLog(@"[aaoracled] WARNING: DCAppAttestService.isSupported == NO");
+        // No isSupported check at startup. It reports NO on this process while
+        // every operation works — see the note at the top of this file. A
+        // warning that fires on every single launch of a working daemon is
+        // noise that trains you to ignore the log.
+        //
         // Accept loop on a background queue; main thread runs the runloop so
         // DCAppAttestService completion handlers are serviced.
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ serve(); });

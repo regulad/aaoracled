@@ -52,41 +52,94 @@ The full HTTP surface is documented as an OpenAPI 3.1 contract in
 (`ssh -L 8181:127.0.0.1:8181 <device-alias>`) or `curl` it directly from an
 on-device shell.
 
-Create (mint + attest) a key under any App ID you choose — this is the core
-oracle primitive:
+The three core routes mirror Apple's own `DCAppAttestService` one-for-one —
+`generateKey`, `attestKey` and `generateAssertion` — because the point is that
+a stub `DeviceCheck.framework` should be able to forward to this daemon
+instead of to a real `devicecheckd`. They are **separate calls**, exactly as
+they are in the framework.
+
+Request bodies are closed: any field a route does not accept is a `400`
+naming it, rather than being silently ignored.
+
+A helper for the percent-encoding, since both `keyId`s and keychain labels
+are standard base64 and `/` must become `%2F` in a path:
 
 ```bash
-CDH=$(openssl rand -base64 32)   # in real use: base64(SHA-256(server challenge))
+API=http://127.0.0.1:8181
+enc() { python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
+cdh() { openssl rand -base64 32; }   # in real use: base64(SHA-256(server challenge))
+```
 
-curl -s -X POST http://127.0.0.1:8181/keys \
+**1. `generateKey` — mint a key under any App ID you choose.** This is the
+core oracle primitive: `appId` is caller-chosen, and nothing about this
+process is legitimately provisioned for it. No attestation and no Apple
+round trip happen here.
+
+```bash
+KEYID=$(curl -s -X POST $API/keys \
   -H 'Content-Type: application/json' \
-  -d "{\"appId\": \"ABCDE12345.com.example.myapp\", \"environment\": \"development\", \"clientDataHash\": \"$CDH\"}"
+  -d '{"appId": "ABCDE12345.com.example.myapp", "environment": "development"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["keyId"])')
 ```
 
-List every App Attest key resident on the device (not just ones `aaoracled`
-itself minted — see Vulnerability & Mitigation below):
+**2. `attestKey` — attest it over a server challenge.** This is the Apple CA
+round trip. The `appId` must match the one the key was minted under; passing a
+different one is undefined behaviour.
 
 ```bash
-curl -s http://127.0.0.1:8181/keys
+curl -s -X POST "$API/keys/$(enc "$KEYID")/attest" \
+  -H 'Content-Type: application/json' \
+  -d "{\"appId\": \"ABCDE12345.com.example.myapp\", \"clientDataHash\": \"$(cdh)\"}"
 ```
 
-Sign an arbitrary challenge with any listed key. The `key` value returned
-by `GET /keys` must be URL-encoded before it goes in a path — it contains
-`:` plus base64's `+`/`/`/`=`:
+There is deliberately no `environment` field here — it was burned into the
+key at mint time and is read back off the device, so a mint/attest mismatch
+cannot be expressed.
+
+**3. `generateAssertion` — sign subsequent requests with the attested key.**
+Returns the CBOR `{signature, authenticatorData}` a relying party expects.
+devicecheckd builds `authenticatorData` itself, including the key's
+monotonically incrementing counter.
+
+```bash
+curl -s -X POST "$API/keys/$(enc "$KEYID")/assert" \
+  -H 'Content-Type: application/json' \
+  -d "{\"appId\": \"ABCDE12345.com.example.myapp\", \"clientDataHash\": \"$(cdh)\"}"
+```
+
+Asserting with a key that was never attested fails with
+`DCErrorInvalidKey` (`com.apple.devicecheck.error` code `3`).
+
+### Device-wide key access
+
+The routes above address a key by its **`keyId`**. The routes below address it
+by its **opaque keychain label**, which is a different identifier — `GET /keys`
+returns labels, `POST /keys` returns a `keyId`, and they are not
+interchangeable.
+
+List every App Attest key resident on the device, not just ones `aaoracled`
+minted (see Vulnerability & Mitigation below):
+
+```bash
+curl -s $API/keys
+```
+
+Sign arbitrary bytes with any listed key. This is a **lower-level primitive
+than `generateAssertion`** — a raw ECDSA signature over whatever you hand it,
+with no identity and no counter — so it accepts 1..4096 bytes and can be used
+to assemble an assertion client-side:
 
 ```bash
 KEY='aa:9Ur1MdQmPZZbOLudX+0T2lAbouGfiPZH1GQOIRyp88Y=d:...'
-ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$KEY")
-
-curl -s -X POST "http://127.0.0.1:8181/keys/$ENC/sign" \
+curl -s -X POST "$API/keys/$(enc "$KEY")/sign" \
   -H 'Content-Type: application/json' \
-  -d "{\"clientDataHash\": \"$CDH\"}"
+  -d "{\"clientDataHash\": \"$(cdh)\"}"
 ```
 
 Delete a key from the device permanently:
 
 ```bash
-curl -s -X DELETE "http://127.0.0.1:8181/keys/$ENC"
+curl -s -X DELETE "$API/keys/$(enc "$KEY")"
 ```
 
 ## Vulnerability & Mitigation
