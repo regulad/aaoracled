@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: aaoracled
-  version: 0.2.0
+  version: 0.3.0
   summary: On-device App Attest oracle.
   description: |
     `aaoracled` runs **on the jailbroken device** and exposes a small REST API
@@ -44,7 +44,7 @@ servers:
 
 tags:
   - name: keys
-    description: List, mint, sign with, and delete App Attest keys.
+    description: List, mint, attest, sign with, and delete App Attest keys.
 
 paths:
   /health:
@@ -121,22 +121,37 @@ paths:
 
     post:
       operationId: createKey
-      summary: Mint + attest a new key for a given App ID.
+      summary: Mint a new key for a given App ID (generateKey only).
       description: |
-        Generates a fresh Secure Enclave key and attests it over the supplied
-        `clientDataHash`, bound to the requested `appId`. This is the core oracle
-        primitive: `appId` is a **caller-chosen** input — the whole point of the
-        research is to observe whether devicecheckd/Apple issue a valid
-        attestation carrying that App ID's rpIdHash regardless of what this
-        process is legitimately provisioned for (the A-E matrix).
+        Generates a fresh Secure Enclave key bound to the requested `appId` and
+        `environment`, and returns its `keyId`. **This is `generateKey` and
+        nothing else — it does not attest.** Attest separately via
+        `POST /keys/{keyId}/attest`.
 
-        The response is a one-time snapshot of what was just minted — it is
-        not stored. The new key shows up in a subsequent `GET /keys` like any
-        other, addressed by its own opaque label, not by the `keyId` returned
-        here.
+        > **Breaking change in 0.3.0.** This operation used to mint *and*
+        > attest in one request, taking a `clientDataHash` and returning an
+        > `attestation`. It no longer does either. `generateKey` and
+        > `attestKey` are independently callable operations in Apple's
+        > framework, and Apple's own flow separates them — a fused endpoint
+        > cannot back a stub `DeviceCheck.framework`, which is this project's
+        > end goal (see `AGENTS.md`).
 
-        Each call mints a new key and performs one Apple attestation round trip
-        (rate-limit / risk_metric sensitive — mint deliberately).
+        `appId` is a **caller-chosen** input: the whole point of the research
+        is that devicecheckd derives identity in application-processor
+        userspace, so a caller can name an App ID this process was never
+        provisioned for.
+
+        `environment` is burned into the credential's keychain label here, at
+        mint time. That is why the attest operation does not accept it — it is
+        read back off the label instead of being supplied twice.
+
+        Nothing is stored. The key becomes addressable two ways, in two
+        **different identifier namespaces**: by the `keyId` returned here
+        (`POST /keys/{keyId}/attest`), and by its own opaque keychain label
+        (`GET /keys`, sign, delete). They are not interchangeable.
+
+        No Apple network round trip happens here — key generation is local to
+        the Secure Enclave. The CA round trip happens at attest time.
       tags: [keys]
       requestBody:
         required: true
@@ -145,7 +160,7 @@ paths:
             schema: { $ref: "#/components/schemas/CreateKeyRequest" }
       responses:
         "201":
-          description: Key minted and attested.
+          description: Key minted. Not yet attested.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/CreateKeyResponse" }
@@ -153,9 +168,111 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "502":
           description: |
-            devicecheckd / Apple's attestation service rejected the request
-            (e.g. refused the requested App ID). The body reports the underlying
-            DCError. For the matrix, a rejection here is itself a result.
+            devicecheckd refused to generate the key. The body reports the
+            underlying DCError.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /keys/{keyId}/attest:
+    post:
+      operationId: attestKey
+      summary: Attest a previously minted key.
+      description: |
+        Calls `attestKey:clientDataHash:completionHandler:` on a key minted by
+        an **earlier** `POST /keys` request, and returns the resulting CBOR
+        attestation object.
+
+        Apple's framework takes exactly two inputs here — the `keyId` and the
+        `clientDataHash` — and this operation adds exactly one more, `appId`,
+        because the real framework derives the caller's identity from its
+        audit token and this process cannot. Nothing else is required.
+
+        **There is deliberately no `environment` field.** The environment was
+        burned into this key's credential keychain label at `generateKey` time,
+        so it is read back off the device. A mint/attest environment mismatch is
+        therefore not expressible.
+
+        `appId` **must** be the App ID the key was created under. Passing a
+        different one is **UNDEFINED BEHAVIOUR**: the keychain label records
+        `SHA256(appId)` at creation, so a mismatched attest leaves the key's
+        recorded identity inconsistent with the identity in the issued
+        certificate. Whether `attestKey` rejects the mismatch, honours the
+        creation-time identity, or honours the attest-time identity is
+        unverified and **not contracted**. Do not rely on any of the three.
+
+        **Attesting the same key more than once is also UNDEFINED
+        BEHAVIOUR — but it was observed to work.** `DCError.h` documents
+        `DCErrorInvalidKey` for calling `attestKey` on "a key that's already
+        been attested". That is not what this implementation measured: on the
+        reference device (`iPad5,1` / build `19H422`, development
+        environment, 2026-10-10) a second attest of an already-attested key
+        returned **HTTP 200 with a second valid attestation**, carrying a
+        distinct certificate serial and validity window but the same subject
+        CN — i.e. Apple's CA issued a fresh certificate over the same key.
+
+        Treat that as unspecified in both directions. Apple documents a
+        failure; one observation on one device and OS build in one
+        environment showed a success. It has not been checked in production,
+        nor repeated enough to say whether it is rate-limited or bounded.
+        Do not build on either outcome.
+
+        > `{keyId}` here is the **keyId** from `POST /keys` — *not* the opaque
+        > keychain label used by `POST /keys/{key}/sign` and
+        > `DELETE /keys/{key}`. Two identifier namespaces occupy the same path
+        > position, disambiguated by the operation suffix. Labels always begin
+        > `aa:`, so routing is unambiguous, but do not pass one where the other
+        > is expected.
+
+        This performs one Apple CA round trip and is rate-limit /
+        `risk_metric` sensitive.
+      tags: [keys]
+      parameters:
+        - name: keyId
+          in: path
+          required: true
+          description: |
+            The `keyId` returned by `POST /keys`, percent-encoded. It is
+            standard base64, so `+`, `/` and `=` must all be escaped — `/` in
+            particular must become `%2F`.
+          schema: { type: string }
+          example: "AyiKfDNaC%2B7s9b9MvDiGHxeWvMfbNPuEZVvuBp5Hd9E%3D"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AttestRequest" }
+      responses:
+        "200":
+          description: Attestation issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AttestResponse" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: |
+            No credential on this device matches that `keyId`. The mapping is
+            computed, not stored: the credential keychain label embeds
+            `SHA256(utf8(keyId))`, so a `keyId` that matches no label does not
+            exist here.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: |
+            devicecheckd or Apple's attestation service rejected the request.
+            The body reports the underlying DCError.
+
+            `DCErrorServerUnavailable` means the CA was unreachable. Apple's
+            guidance for that case is to retry later with the *same* key and
+            the *same* `clientDataHash` to preserve the device's risk metric —
+            which only this split endpoint makes expressible at all.
+
+            `DCErrorInvalidKey` is what Apple documents for an
+            already-attested key, but see the operation description: that is
+            not the behaviour measured here, and re-attest is treated as
+            undefined rather than as a reliable error.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -250,7 +367,16 @@ paths:
 components:
   responses:
     BadRequest:
-      description: Malformed request (bad base64, missing field, bad appId shape).
+      description: |
+        Malformed request (bad base64, missing field, bad appId shape), or a
+        field the endpoint does not accept.
+
+        Request bodies are **closed**: every request schema is
+        `additionalProperties: false`, and the daemon rejects unknown fields
+        with `error: "unknown_field"` naming them. This is deliberate — 0.3.0
+        removed `clientDataHash` from `POST /keys`, and an ignored-field
+        response would hand a 0.2.0 client a 201 with a silently different
+        shape instead of an error.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -323,16 +449,11 @@ components:
 
     CreateKeyRequest:
       type: object
+      additionalProperties: false
       properties:
         appId: { $ref: "#/components/schemas/AppId" }
         environment: { $ref: "#/components/schemas/Environment" }
-        clientDataHash:
-          allOf: [{ $ref: "#/components/schemas/Base64" }]
-          description: |
-            The 32-byte SHA-256 hash the attestation is bound to (typically
-            `SHA256(server_challenge)`). The relying party computes this;
-            aaoracled passes it straight to `attestKey`.
-      required: [appId, clientDataHash]
+      required: [appId]
 
     CreateKeyResponse:
       type: object
@@ -340,12 +461,53 @@ components:
         keyId:
           allOf: [{ $ref: "#/components/schemas/Base64" }]
           description: >-
-            The credentialId App Attest assigned this key, as returned by
-            `generateKey`/`attestKey` directly. NOT the same string as the
-            opaque label `GET /keys` returns for this same key — use that
-            label, from a subsequent listing, to sign or delete it later.
+            The credentialId App Attest assigned this key. Pass it back to
+            `POST /keys/{keyId}/attest`. NOT the same string as the opaque
+            label `GET /keys` returns for this same key — use that label, from
+            a subsequent listing, to sign or delete it. It is
+            `base64(SHA256(uncompressed public key point))`, so it is derived
+            from the key rather than assigned arbitrarily.
         appId: { $ref: "#/components/schemas/AppId" }
         environment: { $ref: "#/components/schemas/Environment" }
+      required: [keyId, appId, environment]
+
+    AttestRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        appId:
+          allOf: [{ $ref: "#/components/schemas/AppId" }]
+          description: |
+            The App ID to present to devicecheckd for this call. **Must be the
+            same App ID the key was minted under** — passing a different one is
+            undefined behaviour (see the operation description).
+
+            Required only because this process has no legitimate identity for
+            devicecheckd to derive. Apple's `attestKey` takes no such argument.
+        clientDataHash:
+          allOf: [{ $ref: "#/components/schemas/Base64" }]
+          description: |
+            The 32-byte SHA-256 hash the attestation is bound to (typically
+            `SHA256(server_challenge)`). Passed straight to `attestKey`.
+
+            Because the key already exists by the time this is called, a hash
+            that depends on the `keyId` — e.g. `SHA256(utf8(keyId))`, which
+            some relying parties use in place of a server challenge — can
+            simply be computed by the caller from the `keyId` that
+            `POST /keys` returned. The daemon does not need to derive it.
+      required: [appId, clientDataHash]
+
+    AttestResponse:
+      type: object
+      properties:
+        keyId: { $ref: "#/components/schemas/Base64" }
+        appId: { $ref: "#/components/schemas/AppId" }
+        environment:
+          allOf: [{ $ref: "#/components/schemas/Environment" }]
+          description: >-
+            Read back from the credential's keychain label, not supplied by the
+            caller. This is the environment actually burned into the key at
+            mint time, so it is ground truth rather than an echo.
         attestation:
           allOf: [{ $ref: "#/components/schemas/Base64" }]
           description: CBOR `apple-appattest` attestation object, base64-encoded.
@@ -354,6 +516,7 @@ components:
 
     SignRequest:
       type: object
+      additionalProperties: false
       properties:
         clientDataHash:
           allOf: [{ $ref: "#/components/schemas/Base64" }]

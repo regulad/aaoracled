@@ -344,6 +344,49 @@ is an OS-coupled component; if it tracks the SoC, SEP firmware; if constant
 across both, a format or protocol version. Failing that, Ghidra on
 `AppAttestInternal` to find what feeds tag `[1401]`.
 
+## 7. A key can be attested more than once, contradicting `DCError.h`
+
+`DCError.h` documents `DCErrorInvalidKey` as the result of calling
+`attestKey:clientDataHash:completionHandler:` for "a key that's already been
+attested". That is not what this device does.
+
+Measured through aaoracled 0.3.0's split endpoints (which is what made the
+test possible at all — the fused `POST /keys` always minted a fresh key, so
+it could never re-attest one), development environment, App B:
+
+1. `POST /keys` minted `ss4fYwJuq3g74AjvLxWNFyIzfDjFwoIG+ZFttnaGnlE=`.
+2. `POST /keys/{keyId}/attest` → **HTTP 200**, valid attestation.
+3. The same endpoint, same `keyId`, a *different* `clientDataHash` →
+   **HTTP 200**, a second valid attestation.
+
+The two are separate issuances over the same key, not a cached response: the
+leaf certificates carry validity windows one second apart
+(`261009230621Z`..`261012230621Z` versus `261009230622Z`..`261012230622Z`)
+and differ from each other starting in the certificate serial field, while
+sharing an identical subject CN —
+`b2ce1f63026eab783be008ef2f158d1722337c38c5c28206f9916db676869e51`, which is
+the hex of that same keyId. Apple's CA issued a fresh certificate for an
+already-attested key rather than refusing.
+
+**Strength of this result: weak, deliberately stated as such.** One
+observation, one device, one OS build, one environment. A planned three-call
+repeat was not run. Production was not tested. Nothing here establishes
+whether re-attestation is unlimited, bounded, or rate-limited, nor whether
+Apple's own risk metric treats it differently from a fresh key. The contract
+(`openapi.yaml`) therefore documents re-attest as **undefined behaviour in
+both directions** — Apple documents a failure, this measured a success — and
+does not let callers rely on either.
+
+**Why it is worth chasing.** `README.md` notes that Apple "may rate-limit
+attestation key creation attempts per device", and that limit is the main
+natural brake on an oracle like this one: if every relying-party challenge
+needs its own key, throughput is capped by key creation. If a single key can
+instead be re-attested over arbitrarily many fresh challenges, that brake is
+much weaker than it appears, and the per-key `generateKey` limit is no longer
+the binding constraint. Establishing whether re-attest is actually unbounded
+is the difference between an interesting inconsistency and a materially
+larger finding.
+
 ## Open questions
 
 1. Does omitting `1.2.840.113635.100.8.7` from `OIDSToInclude` produce a
@@ -363,7 +406,19 @@ across both, a format or protocol version. Failing that, Ghidra on
 6. What is inside `RKCertification`'s 872 bytes?
 7. Is `register.appattest.apple.com` the production endpoint?
 8. Does a delayed `attestKey` succeed across two separate forge windows?
-   (Unresolved — the original Phase 0 question, not yet tested.)
+   **Answered 2026-10-10: yes.** A key minted by one `POST /keys` request
+   attests successfully from a later `POST /keys/{keyId}/attest`, with the
+   forge file verified absent between the two. This is what makes the 0.3.0
+   split viable.
+9. **Is re-attestation bounded?** Finding 7 observed it succeeding once.
+   Repeat it n times on one key, and in the production environment, and
+   watch for a rate limit or a refusal. This determines whether the
+   per-device key-creation limit is a real constraint on an oracle.
+10. Does `attestKey` read the App ID at all, or only record it at
+    `generateKey`? The keychain label embeds `SHA256(appId)` from creation,
+    but whether a mismatched attest is rejected, honours the creation-time
+    identity, or honours the attest-time identity is untested. Documented as
+    undefined behaviour in `openapi.yaml` rather than resolved.
 
 ## Appendix A — raw artifacts
 

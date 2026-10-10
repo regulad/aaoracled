@@ -137,6 +137,34 @@ static Resp R(int status, NSDictionary *json) { return (Resp){status, json}; }
 static Resp Err(int status, NSString *code, NSString *detail) {
     return R(status, detail ? @{@"error": code, @"detail": detail} : @{@"error": code});
 }
+
+// Every field in `body` that this endpoint does not accept, sorted and
+// comma-joined; nil when the body is clean (or isn't a dictionary at all —
+// shape validation of the body itself belongs to the handler).
+//
+// Request bodies are CLOSED on purpose. 0.3.0 removed `clientDataHash` from
+// POST /keys, and without this an 0.2.0 client would keep receiving a 201
+// with that field silently ignored and no attestation in the response — a
+// different response shape rather than an error, which is the worst way to
+// ship a breaking change. Rejecting unknown fields turns every such call
+// into a loud 400 naming exactly what was wrong. It also catches plain
+// typos, which in an API whose fields drive a forged identity are not
+// something to shrug at.
+//
+// Sorted so the message is deterministic: NSDictionary iteration order is
+// unspecified, and an error string that changes between identical requests
+// is a bad thing to put in a contract.
+static NSString *unknownFields(NSDictionary *body, NSArray<NSString *> *allowed) {
+    if (![body isKindOfClass:NSDictionary.class]) return nil;
+    NSMutableArray<NSString *> *bad = [NSMutableArray array];
+    for (id k in body) {
+        if ([k isKindOfClass:NSString.class] && ![allowed containsObject:k])
+            [bad addObject:k];
+    }
+    if (bad.count == 0) return nil;
+    [bad sortUsingSelector:@selector(compare:)];
+    return [bad componentsJoinedByString:@", "];
+}
 // Full diagnostic dump of an NSError: domain, code, and the ENTIRE userInfo
 // (recursing into any NSUnderlyingErrorKey chain) — .localizedDescription
 // alone was hiding whatever devicecheckd/XPC actually says went wrong.
@@ -210,10 +238,54 @@ static Resp handleListKeys(void) {
     return R(200, @{ @"keys": entries });
 }
 
+// The credential keychain label that belongs to a given keyId, or nil.
+//
+// AppAttestInternal's label is
+// `aa:<device>=<d|p>:<rpIdHash>=:<SHA256(utf8(keyId))>=:rk`. The third
+// component is a plain SHA-256 of the keyId's own ASCII (verified 2026-10-10
+// against the single production credential on the reference device — see
+// RESEARCH.md), so keyId -> label is COMPUTABLE with no stored state. That is
+// what lets POST /keys/{keyId}/attest read a key's environment back off the
+// device instead of taking it as a request parameter.
+static NSString *labelForKeyId(NSString *keyId) {
+    NSData *kid = [keyId dataUsingEncoding:NSUTF8StringEncoding];
+    if (!kid) return nil;
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(kid.bytes, (CC_LONG)kid.length, digest);
+    NSString *needle = b64e([NSData dataWithBytes:digest length:CC_SHA256_DIGEST_LENGTH]);
+
+    NSData *dummyHash = [NSMutableData dataWithLength:32];
+    NSError *err = nil;
+    NSData *result = dcAssert(kOracledListSEKeysSentinel, dummyHash, &err);
+    if (!result) return nil;
+    id parsed = [NSJSONSerialization JSONObjectWithData:result options:0 error:nil];
+    NSArray *raw = [parsed isKindOfClass:NSDictionary.class] ? parsed[@"keys"] : nil;
+    if (![raw isKindOfClass:NSArray.class]) return nil;
+    for (NSString *label in raw) {
+        if ([label isKindOfClass:NSString.class] &&
+            [label rangeOfString:needle].location != NSNotFound)
+            return label;
+    }
+    return nil;
+}
+
+// POST /keys — generateKey ONLY, as of 0.3.0.
+//
+// This used to mint AND attest in one request. The framework's
+// generateKey/attestKey are independently callable, and Apple's own flow
+// separates them (DCAppAttestService.h instructs retrying a failed attest
+// "using the same key and client data hash later"), so a fused endpoint
+// cannot back a faithful stub DeviceCheck.framework. See AGENTS.md's
+// "End goal" section. Breaking change, hence 0.3.0.
 static Resp handleCreateKey(NSDictionary *body) {
+    NSString *unknown = unknownFields(body, @[@"appId", @"environment"]);
+    if (unknown)
+        return Err(400, @"unknown_field",
+                   [NSString stringWithFormat:@"POST /keys does not accept: %@. "
+                    @"As of 0.3.0 it mints only — attest via "
+                    @"POST /keys/{keyId}/attest.", unknown]);
     NSString *appId = body[@"appId"];
     NSString *env = body[@"environment"] ?: @"development";
-    NSData *cdh = b64d(body[@"clientDataHash"]);
     if (![appId isKindOfClass:NSString.class]) return Err(400, @"bad_request", @"appId required");
     // `?: @"development"` above does NOT cover a JSON `null`: that arrives as
     // NSNull, which is a live object and therefore truthy, so it sails past
@@ -227,34 +299,81 @@ static Resp handleCreateKey(NSDictionary *body) {
     if (![env isKindOfClass:NSString.class] ||
         ![@[@"development", @"production"] containsObject:env])
         return Err(400, @"bad_request", @"environment must be \"development\" or \"production\"");
-    if (cdh.length != 32) return Err(400, @"bad_request", @"clientDataHash must be 32 bytes (base64)");
 
     // Forge lever: tells the injected devicecheckd tweak (Tweak.x) which App
-    // ID to present AND which environment to force for these calls,
-    // regardless of our own process's actual (ad-hoc, unentitled)
-    // code-signing identity. Both generateKey and attestKey happen inside
-    // this window: the environment is burned into the credential's keychain
-    // label at generateKey time and into the AAGUID at attestKey time, so the
-    // override has to stay armed across both — which it does, since
-    // clearForgeAppId() runs only after dcAttest returns.
+    // ID to present AND which environment to force for this call, regardless
+    // of our own process's actual (ad-hoc, unentitled) code-signing identity.
+    // The environment is burned into the credential's keychain label right
+    // here, at generateKey time — which is why the attest route can read it
+    // back off the label later instead of being told it again.
     setForgeAppId(appId, env);
     NSError *err = nil;
     NSString *keyId = dcGenerateKey(&err);
-    if (!keyId) { clearForgeAppId(); return Err(502, @"generateKey_failed", fullErrorDump(err)); }
+    clearForgeAppId();
+    if (!keyId) return Err(502, @"generateKey_failed", fullErrorDump(err));
+
+    // Nothing stored. The key is now addressable two ways, and they are
+    // different namespaces: by this keyId (POST /keys/{keyId}/attest) and by
+    // its own opaque keychain label (GET /keys, sign, delete).
+    return R(201, @{@"keyId": keyId, @"appId": appId, @"environment": env});
+}
+
+// POST /keys/{keyId}/attest — attestKey on a key minted by an EARLIER
+// request.
+//
+// Takes only what the framework's
+// attestKey:clientDataHash:completionHandler: takes, plus the App ID, which
+// the real framework derives from the calling process and this one cannot.
+// Deliberately NO `environment` field: it was burned into the key's keychain
+// label at generateKey time, so it is read back from the device rather than
+// trusted from the caller — which also makes a mint/attest environment
+// mismatch impossible to express.
+//
+// `appId` MUST match the App ID the key was created under. Passing a
+// different one is UNDEFINED BEHAVIOUR: the label records SHA256(appId) at
+// creation, so a mismatched attest leaves the key's recorded identity
+// inconsistent with the identity in the issued certificate. Whether
+// attestKey rejects it, honours the creation-time identity, or honours the
+// attest-time identity is unverified and not contracted.
+static Resp handleAttestKey(NSString *keyId, NSDictionary *body) {
+    NSString *unknown = unknownFields(body, @[@"appId", @"clientDataHash"]);
+    if (unknown)
+        return Err(400, @"unknown_field",
+                   [NSString stringWithFormat:@"POST /keys/{keyId}/attest does not "
+                    @"accept: %@. The environment is read from the key's own "
+                    @"keychain label, not supplied.", unknown]);
+    id cdhIn = body[@"clientDataHash"];
+    NSString *appId = body[@"appId"];
+    NSData *cdh = [cdhIn isKindOfClass:NSString.class] ? b64d(cdhIn) : nil;
+    if (keyId.length == 0)
+        return Err(400, @"bad_request", @"keyId required in path (from POST /keys)");
+    if (![appId isKindOfClass:NSString.class])
+        return Err(400, @"bad_request", @"appId required");
+    if (cdh.length != 32)
+        return Err(400, @"bad_request", @"clientDataHash must be 32 bytes (base64)");
+
+    NSString *label = labelForKeyId(keyId);
+    if (!label)
+        return Err(404, @"unknown_key", @"no credential on this device matches that keyId");
+    NSString *env = environmentFromLabel(label);
+    if (!env) return Err(502, @"unknown_label_shape", label);
+
+    setForgeAppId(appId, env);
+    NSError *err = nil;
     NSData *att = dcAttest(keyId, cdh, &err);
     clearForgeAppId();
     if (!att) return Err(502, @"attestKey_failed", fullErrorDump(err));
 
-    // Nothing stored: this response is a one-time snapshot of what was just
-    // minted, not a promise it's retrievable again under this same keyId
-    // later — GET /keys addresses it by its own opaque label from here on.
-    return R(201, @{
-        @"keyId": keyId, @"appId": appId, @"environment": env,
-        @"attestation": b64e(att), @"counter": @0,
-    });
+    return R(200, @{@"keyId": keyId, @"appId": appId, @"environment": env,
+                    @"attestation": b64e(att), @"counter": @0});
 }
 
 static Resp handleSignKey(NSString *key, NSDictionary *body) {
+    NSString *unknown = unknownFields(body, @[@"clientDataHash"]);
+    if (unknown)
+        return Err(400, @"unknown_field",
+                   [NSString stringWithFormat:@"POST /keys/{key}/sign does not "
+                    @"accept: %@", unknown]);
     NSData *cdh = b64d(body[@"clientDataHash"]);
     if (key.length == 0)
         return Err(400, @"bad_request", @"key required in path (from GET /keys)");
@@ -319,6 +438,16 @@ static Resp route(NSString *method, NSString *path, NSDictionary *body) {
     if ([path hasPrefix:@"/keys/"] && [path hasSuffix:@"/sign"] && [method isEqualToString:@"POST"]) {
         NSString *mid = [path substringWithRange:NSMakeRange(6, path.length - 6 - 5)];
         return handleSignKey([mid stringByRemovingPercentEncoding], body);
+    }
+    // NOTE the path variable here is a keyId, while /keys/{key}/sign and
+    // DELETE /keys/{key} take an opaque keychain LABEL. Two identifier
+    // namespaces in the same path position, disambiguated only by the
+    // suffix. Routing is unambiguous (labels always start `aa:`), but it is a
+    // wart; resolving it properly means moving one of the two under its own
+    // prefix, which is an open contract decision.
+    if ([path hasPrefix:@"/keys/"] && [path hasSuffix:@"/attest"] && [method isEqualToString:@"POST"]) {
+        NSString *mid = [path substringWithRange:NSMakeRange(6, path.length - 6 - 7)];
+        return handleAttestKey([mid stringByRemovingPercentEncoding], body);
     }
     if ([path hasPrefix:@"/keys/"] && [method isEqualToString:@"DELETE"]) {
         NSString *key = [path substringFromIndex:6];
