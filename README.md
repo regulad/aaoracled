@@ -111,34 +111,93 @@ App IDs that the device it runs on could never run legitimately, turning
 an old, jailbroken device into a sockpuppet that forges attestations for
 apps that would otherwise require current hardware. Paired with an iOS
 simulator or a stripped-down app runtime, a request attested by
-`aaoracled` is indistinguishable from one emitted by a genuine, up-to-date
-device: App Attest keys carry no device-specific metadata — no OS version
-and no hardware model string — so a publisher cannot tell which device or
-OS release minted a key. That gap matters because publishers routinely
-raise the minimum OS version of their apps to keep unpatched or
-known-compromised devices out, and an attestation minted below that floor
-sails straight past the check. Apple *can* close it: it could refuse to
-sign certificate requests emitted by `com.apple.devicecheckd` when the
-SEP-backed key came from a device whose maximum supported iOS is lower
-than the minimum iOS of the App ID named in the request. As of
-publication, Apple's App Attest CSR-signing infrastructure performs no
-such check and will sign any request carrying a well-formed App ID. The OS
-floor is only the most legible casualty of a more general limit: what an
-App Attest assertion actually proves is that a genuine Secure Enclave
-exists somewhere behind the request — not which device holds it, not what
-that device is running, and not what software asked it to sign.
+`aaoracled` carries a genuine, Apple-signed attestation naming an App ID
+the device was never provisioned for — because `devicecheckd` derives that
+identity entirely in application-processor userspace, and the Secure
+Enclave signs whatever it is handed. Apple's App Attest CA will sign any
+request carrying a well-formed App ID; the identity binding fails open.
+
+What the attestation discloses about the *device*, however, is more than
+this project originally credited, and it is the lever a relying party
+actually has. The credential certificate's leaf carries extension
+`1.2.840.113635.100.8.7`, which reports an OS version for the minting
+device — measured as `15.8.8` on the reference iPad mini 4, in both the
+development and production environments (see [RESEARCH.md](RESEARCH.md)
+for the full decode, the raw blobs, and the date that data was collected).
+
+Be precise about what that field is and is not. It is **not** an integrity
+measurement: there is no hardware model string, and no measurement of the
+OS or of the app binary, anywhere in the attestation. It is also **not**
+something the client reports — the registration request this tool sends to
+Apple contains no software or OS version field at all, which was verified
+by decoding every layer of it. So the value is not trivially chosen by a
+compromised client, and that is what makes it worth checking.
+
+What it means beyond that is genuinely undetermined. Its provenance is
+unverified: it may come from Apple's own records for the device, or from a
+component of the request this research could not decode. And the reference
+device is sitting on its *terminal* release — `15.8.8` is the last
+iPadOS build ever shipped for `iPad5,1` — so a single sample cannot
+distinguish "the OS this device is running" from "the newest OS this
+hardware can run." Rolling the device back to a much older release may
+well still produce `15.8.8` here; that experiment has not been done. The
+only claim this research supports is the weak one: **the field reports a
+version that this device's hardware is capable of running.**
+
+That is still worth checking, because publishers routinely raise the
+minimum OS version of their apps to keep unpatched or known-compromised
+devices out, and an oracle like this one runs on hardware that is old
+enough to be jailbreakable. Note carefully what the check therefore buys:
+it excludes hardware that *cannot* reach your minimum — which is the
+sockpuppet case this tool demonstrates. It may well **not** detect a
+current device that has been downgraded to an old, vulnerable release,
+since such a device could report a version it is merely capable of.
+
+The OS floor is only the most legible casualty of a more general limit:
+what an App Attest assertion actually proves is that a genuine Secure
+Enclave exists somewhere behind the request — not which device holds it,
+and not what software asked it to sign.
 
 If you are developing an app that needs to enforce the integrity of its
 operating environment, please note the following when using App Attest:
 
-1. App Attest can **only** be used to advocate for the presence of a
+1. **Your origin server *must* verify the OS version baked into the
+   attestation, and reject anything below the floor your app actually
+   supports.** Parse extension `1.2.840.113635.100.8.7` out of the
+   credential certificate's leaf and require that the OS version it
+   reports is at least the minimum OS your current release runs on. This
+   is not optional hardening — it is the one check that excludes hardware
+   old enough to be a sockpuppet, and its absence is what makes this tool
+   useful. The data is already in a certificate you have to parse anyway,
+   and the client does not supply it: this tool's registration request
+   carries no OS or software version field, so the value is not one a
+   compromised client simply fills in.
+
+   Understand its limit. All this research establishes is that the field
+   reports a version the minting device's hardware is *capable* of
+   running. It is not an integrity measurement, and it has **not** been
+   shown to reflect the OS actually running at attestation time — a
+   downgraded current device may be able to report a version it merely
+   supports. So this check raises the hardware floor; it does not tell you
+   the client is patched. See [RESEARCH.md](RESEARCH.md).
+
+   **Fail closed.** The set of extensions Apple stamps into the leaf is
+   *requested by the device*, in the signed `OIDSToInclude` field of the
+   registration request — and the `AppID` in that same signed structure is
+   demonstrably forgeable by the tweak in this repository. Treat a
+   **missing** `1.2.840.113635.100.8.7` as a failed check, never as "no
+   opinion." A version check that silently passes when the field is absent
+   can be defeated by simply not asking for the field. Whether that
+   omission actually succeeds was still untested as of 2026-10-10; assume
+   it works until someone demonstrates otherwise.
+2. App Attest can **only** be used to advocate for the presence of a
    legitimate, Apple-provisioned Secure Element *somewhere* that the
    request sender controls. It is a strong trust signal, but it can only be
    used to prove that a real Apple device is being used — never that your
    app or the OS is unmodified, since a device that has been completely
    compromised via a jailbreak still has a fully operational, functional
    Secure Enclave.
-2. Use App Attest alongside other difficult-to-spoof checks, like
+3. Use App Attest alongside other difficult-to-spoof checks, like
    MobileSubstrate/ElleKit detection — and always remember that **any
    client-side restriction can be bypassed; anything life-or-death *must*
    be enforced server-side!**
