@@ -110,37 +110,44 @@ curl -s -X POST "$API/keys/$(enc "$KEYID")/assert" \
 Asserting with a key that was never attested fails with
 `DCErrorInvalidKey` (`com.apple.devicecheck.error` code `3`).
 
-### Device-wide key access
+### `/labels` — device-wide credential access
 
-The routes above address a key by its **`keyId`**. The routes below address it
-by its **opaque keychain label**, which is a different identifier — `GET /keys`
-returns labels, `POST /keys` returns a `keyId`, and they are not
-interchangeable.
+`/keys` above is the framework surface, addressed by `keyId`. `/labels` is a
+**separate hierarchy** for the privileged device-wide keychain surface,
+addressed by an opaque AppAttestInternal label. It has no framework
+counterpart at all — it exists only because `devicecheckd` is compromised, and
+no stub framework would ever call it.
 
-List every App Attest key resident on the device, not just ones `aaoracled`
+The two identifiers are not interchangeable: `POST /keys` returns a `keyId`,
+`GET /labels` returns labels. Labels always begin `aa:`, and passing a `keyId`
+to a `/labels` route is a `400` rather than a silent no-op.
+
+List every App Attest credential on the device — not just ones `aaoracled`
 minted (see Vulnerability & Mitigation below):
 
 ```bash
-curl -s $API/keys
+curl -s $API/labels
 ```
 
-Sign arbitrary bytes with any listed key. This is a **lower-level primitive
-than `generateAssertion`** — a raw ECDSA signature over whatever you hand it,
-with no identity and no counter — so it accepts 1..4096 bytes and can be used
-to assemble an assertion client-side:
+Delete one permanently:
 
 ```bash
-KEY='aa:9Ur1MdQmPZZbOLudX+0T2lAbouGfiPZH1GQOIRyp88Y=d:...'
-curl -s -X POST "$API/keys/$(enc "$KEY")/sign" \
-  -H 'Content-Type: application/json' \
-  -d "{\"clientDataHash\": \"$(cdh)\"}"
+LABEL='aa:9Ur1MdQmPZZbOLudX+0T2lAbouGfiPZH1GQOIRyp88Y=d:...'
+curl -s -X DELETE "$API/labels/$(enc "$LABEL")"
 ```
 
-Delete a key from the device permanently:
+This is idempotent by Apple's own design: it reports success whether or not
+the credential was present, because `_delete_keychain_item` treats
+`errSecItemNotFound` as success. That applies to real labels only — a value
+that isn't label-shaped is rejected.
 
-```bash
-curl -s -X DELETE "$API/keys/$(enc "$KEY")"
-```
+> **Removed in 0.3.0:** `POST /keys/{key}/sign`, which produced a raw ECDSA
+> signature over arbitrary bytes with no identity and no counter. Its only
+> real use was assembling an assertion client-side, and
+> `POST /keys/{keyId}/assert` now produces a genuine one. The underlying
+> capability — a compromised `devicecheckd` can sign with any credential on
+> the device — still exists in the tweak and remains a finding; only the HTTP
+> route is gone.
 
 ## Vulnerability & Mitigation
 

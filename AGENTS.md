@@ -54,15 +54,28 @@ that only `curl` would ever want.
 The surface a stub has to satisfy, taken from `DeviceCheck.framework`'s own
 SDK headers and `.tbd` (see "Reading the DeviceCheck SDK surface" below):
 
-| Framework entry point | Must map to |
-|---|---|
-| `DCAppAttestService.sharedService` | nothing — no server-side state |
-| `-isSupported` | a capability answer |
-| `-generateKeyWithCompletionHandler:` | mint only, returning the keyId |
-| `-attestKey:clientDataHash:completionHandler:` | attest an **already-minted** keyId |
-| `-generateAssertion:clientDataHash:completionHandler:` | a genuine CBOR assertion, counter managed daemon-side |
-| `DCDevice -generateTokenWithCompletionHandler:` | not App Attest; currently unimplemented |
-| `DCErrorDomain` + its five codes | a documented error mapping |
+| Framework entry point | Maps to | State |
+|---|---|---|
+| `DCAppAttestService.sharedService` | nothing — no server-side state | n/a |
+| `-isSupported` | **nothing, deliberately** | won't do |
+| `-generateKeyWithCompletionHandler:` | `POST /keys` | done (0.3.0) |
+| `-attestKey:clientDataHash:completionHandler:` | `POST /keys/{keyId}/attest` | done (0.3.0) |
+| `-generateAssertion:clientDataHash:completionHandler:` | `POST /keys/{keyId}/assert` | done (0.3.0) |
+| `DCDevice -generateTokenWithCompletionHandler:` | not App Attest | undecided |
+| `DCErrorDomain` + its five codes | a documented error mapping | outstanding |
+
+`isSupported` is not exposed and should not be. It answers for the *calling*
+process, and `aaoracled` is a bare binary with no installed app bundle, so
+LaunchServices has no record for it and the answer is `NO` — while mint,
+attest and assert all work, because the forge supplies the identity
+devicecheckd actually evaluates. A `NO` reported beside a working oracle read
+as "App Attest is unavailable here", which is false. A stub that needs to
+answer `isSupported` for its host app should answer `YES` locally rather than
+asking this daemon a question whose answer describes the wrong process.
+
+The two routes a stub never touches are the `/labels` hierarchy: there is no
+framework verb for enumerating or deleting credentials, because an app is
+only ever supposed to know about its own key.
 
 Two consequences, stated outright because they overrule local convenience:
 
@@ -260,9 +273,17 @@ BOOL    _deleteCredentialKeychainWithLabel(id label);
 was removed, and when it was already gone (Apple's own
 `_delete_keychain_item` treats `SecItemDelete`'s real success and
 `errSecItemNotFound` as equally successful). `aaoracled`'s `DELETE
-/keys/{key}` reflects this directly — 200 whether or not the key was
+/labels/{label}` reflects this directly — 200 whether or not the key was
 present, 500 only for a genuine underlying failure, no invented 404
 bookkeeping on top.
+
+That idempotency used to swallow *caller errors* as well, which is a
+different thing and was a real bug: a `keyId`, or literal garbage, came back
+as `200 {"deleted": true}` having removed nothing (verified 2026-10-10 with
+`DELETE /keys/totally-not-a-label`). Since 0.3.0 a value that does not begin
+`aa:` is rejected with a 400 before the sentinel is ever built. Keep that
+distinction if you touch this: "a real label that was already gone" is
+success, "that was never a label" is a 400.
 
 **Dispatch mechanism — sentinel values smuggled through the existing
 `appAttestationAssert:keyId:clientDataHash:completion:` selector**, checked
@@ -281,15 +302,30 @@ kOracledRawLabelSignPrefix   // + <label> -> raw ECDSA sign with that key
 kOracledRawLabelDeletePrefix // + <label> -> delete that key
 ```
 
-`oracled.m`'s `GET/POST /keys`, `POST /keys/{key}/sign`, and
-`DELETE /keys/{key}` are backed entirely by this mechanism — there is
-deliberately **no in-memory key store** in `oracled.m`; a key that was just
-minted shows up in the next `GET /keys` like any other, addressed by its
-own opaque label (not the `keyId` `POST /keys` returned).
+`oracled.m`'s `GET /labels` and `DELETE /labels/{label}` are backed entirely
+by this mechanism — there is deliberately **no in-memory key store** in
+`oracled.m`; a key that was just minted shows up in the next `GET /labels`
+like any other, addressed by its own opaque label (not the `keyId`
+`POST /keys` returned). `labelForKeyId()` bridges the two namespaces by
+computing `SHA256(utf8(keyId))` and matching it against the listing, which is
+how the attest and assert routes recover a key's environment without storing
+anything.
 
-Keys are standard base64 (RFC 4648 §4, i.e. `+`/`/`/`=`, not URL-safe) plus
+**`kOracledRawLabelSignPrefix` has no caller as of 0.3.0.** `POST
+/keys/{key}/sign` was removed — `POST /keys/{keyId}/assert` produces a
+genuine assertion with devicecheckd's own counter, which is what a stub
+framework needs and what a raw signature could never be. The tweak-side
+handler is intentionally left in place: a compromised devicecheckd being able
+to sign arbitrary bytes with any resident credential is a finding in its own
+right, and deleting the code would delete the evidence. Do not re-expose it
+over HTTP without a reason that `assert` cannot serve.
+
+Labels are standard base64 (RFC 4648 §4, i.e. `+`/`/`/`=`, not URL-safe) plus
 a literal `:` separator — percent-encode the whole value when putting one
-in a URL path (`/` in particular must become `%2F`).
+in a URL path (`/` in particular must become `%2F`). They always begin
+`aa:`, which `DELETE /labels/{label}` relies on to reject a misdirected
+`keyId`: Apple's delete is idempotent and used to answer `200 deleted=true`
+for literal garbage.
 
 ### Environment selection (dev vs prod / the AAGUID) — settled 2026-10-10
 
@@ -341,9 +377,12 @@ effect, which is the kind of coupling worth not depending on.
 
 **The environment is observable for free.** It is baked into the credential
 keychain label's `p`/`d` character at `generateKey` time (see
-`openapi.yaml`'s `Key` schema), so `GET /keys` can report it per key with no
-attestation and no network. That is the cheapest possible verification
-surface for any environment work — one request, no CA involvement.
+`openapi.yaml`'s `Label` schema), so `GET /labels` reports it per credential
+with no attestation and no network. That is the cheapest possible
+verification surface for any environment work — one request, no CA
+involvement. It is also why `POST /keys/{keyId}/attest` and `/assert` take no
+`environment` parameter: they read it back off the key's own label, so a
+mint/attest mismatch is not expressible.
 
 ### Testing discipline
 

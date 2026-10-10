@@ -9,16 +9,40 @@
 // (ad-hoc, unentitled) code-signing identity — that's the whole point of
 // the research.
 //
-// Routes: GET /health, GET /keys, POST /keys, POST /keys/{key}/sign,
-// DELETE /keys/{key}.
+// TWO SEPARATE HIERARCHIES, because they are two different APIs with two
+// different audiences — not two flavours of one resource:
 //
-// There is no in-memory key store. `/keys` is backed entirely by Apple's
-// own device-wide App Attest keychain namespace (every key from every app,
-// real or forged, addressed by an opaque label AppAttestInternal itself
-// assigns) — see Tweak.x for the mechanism. A key this process just minted
-// via POST /keys is immediately visible through GET /keys like any other;
-// nothing here tracks "keys aaoracled created" separately from "keys that
-// exist."
+//   /keys    addressed by keyId. The public DCAppAttestService surface,
+//            one route per framework verb. This is all a stub
+//            DeviceCheck.framework ever forwards:
+//              POST /keys                   generateKey
+//              POST /keys/{keyId}/attest    attestKey
+//              POST /keys/{keyId}/assert    generateAssertion
+//            Note there is deliberately no GET: the public framework has no
+//            enumeration verb at all. An app is expected to remember its own
+//            keyId (DCAppAttestService.h says to record it "right away"), so
+//            offering a listing here would invent a capability the framework
+//            does not have.
+//
+//   /labels  addressed by an opaque AppAttestInternal keychain label. The
+//            privileged device-wide surface, which exists ONLY because
+//            devicecheckd is compromised and has no framework counterpart at
+//            all — no stub would ever call it:
+//              GET    /labels           every credential on the device
+//              DELETE /labels/{label}   delete one
+//
+// Plus GET /health.
+//
+// The keyId and the label are different identifiers for the same key, and
+// mixing them up used to fail silently (DELETE happily reported success for
+// anything). keyId -> label is computable — see labelForKeyId() — but the
+// reverse is not: a label carries only SHA256(appId), never the App ID.
+//
+// There is no in-memory key store. /labels is backed entirely by Apple's own
+// device-wide App Attest keychain namespace (every key from every app, real
+// or forged) — see Tweak.x for the mechanism. A key this process just minted
+// is immediately visible through GET /labels like any other; nothing here
+// tracks "keys aaoracled created" separately from "keys that exist."
 #import <Foundation/Foundation.h>
 #import <DeviceCheck/DeviceCheck.h>
 #import <CommonCrypto/CommonDigest.h>
@@ -217,19 +241,26 @@ static NSString *environmentFromLabel(NSString *label) {
     return nil;
 }
 
-static Resp handleListKeys(void) {
+// Every AppAttestInternal keychain label a label must start with. Used to
+// reject a keyId (or junk) passed where a label belongs — a mistake that used
+// to return 200 "deleted": true and do nothing at all, because Apple's
+// delete is idempotent and cannot distinguish "already gone" from "that was
+// never a label."
+static NSString *const kLabelPrefix = @"aa:";
+
+static Resp handleListLabels(void) {
     NSData *dummyHash = [NSMutableData dataWithLength:32];
     NSError *err = nil;
     NSData *result = dcAssert(kOracledListSEKeysSentinel, dummyHash, &err);
-    if (!result) return Err(502, @"list_keys_failed", fullErrorDump(err));
+    if (!result) return Err(502, @"list_labels_failed", fullErrorDump(err));
     NSError *jsonErr = nil;
     id parsed = [NSJSONSerialization JSONObjectWithData:result options:0 error:&jsonErr];
     if (![parsed isKindOfClass:NSDictionary.class]) {
-        return Err(502, @"list_keys_bad_response", jsonErr ? jsonErr.localizedDescription : @"non-JSON response");
+        return Err(502, @"list_labels_bad_response", jsonErr ? jsonErr.localizedDescription : @"non-JSON response");
     }
 
     // Enrich the tweak's raw label list: each entry becomes
-    // {key, environment}. `environment` is null for a label whose shape we
+    // {label, environment}. `environment` is null for a label whose shape we
     // don't recognize rather than guessed at — an unknown label layout is
     // worth seeing as unknown.
     NSArray *raw = parsed[@"keys"];
@@ -237,10 +268,10 @@ static Resp handleListKeys(void) {
     NSMutableArray *entries = [NSMutableArray arrayWithCapacity:raw.count];
     for (NSString *label in raw) {
         NSString *env = environmentFromLabel(label);
-        [entries addObject:@{ @"key": label ?: @"",
+        [entries addObject:@{ @"label": label ?: @"",
                               @"environment": env ?: NSNull.null }];
     }
-    return R(200, @{ @"keys": entries });
+    return R(200, @{ @"labels": entries });
 }
 
 // The credential keychain label that belongs to a given keyId, or nil.
@@ -319,7 +350,7 @@ static Resp handleCreateKey(NSDictionary *body) {
 
     // Nothing stored. The key is now addressable two ways, and they are
     // different namespaces: by this keyId (POST /keys/{keyId}/attest) and by
-    // its own opaque keychain label (GET /keys, sign, delete).
+    // its own opaque keychain label (GET /labels, DELETE /labels/{label}).
     return R(201, @{@"keyId": keyId, @"appId": appId, @"environment": env});
 }
 
@@ -375,21 +406,22 @@ static Resp handleAttestKey(NSString *keyId, NSDictionary *body) {
 
 // POST /keys/{keyId}/assert — generateAssertion on an attested key.
 //
-// This is the real framework operation, and it is NOT the same thing as
-// POST /keys/{key}/sign. Here devicecheckd builds authData itself (rpIdHash
-// plus its own monotonically incrementing counter for the key) and the SEP
-// signs over authData || clientDataHash, yielding the CBOR
-// {signature, authenticatorData} a relying party expects. /sign is a
-// deliberately lower-level primitive: a raw ECDSA signature over whatever
-// bytes the caller hands it, bypassing identity and the counter entirely.
+// devicecheckd builds authData itself (rpIdHash plus its own monotonically
+// incrementing counter for the key) and the SEP signs over
+// authData || clientDataHash, yielding the CBOR
+// {signature, authenticatorData} a relying party expects. Verified on
+// hardware 2026-10-10: three successive calls on one key reported counter
+// 1, 2, 3, with a 37-byte authData carrying no AAGUID.
 //
-// A stub DeviceCheck.framework cannot build an assertion out of /sign,
-// because the counter is devicecheckd's state and nothing outside it knows
-// the current value. Inventing one desynchronises every other holder of the
-// key and breaks a relying party's counter-increased check. Hence this route.
+// This replaced the old raw-label sign route, which signed arbitrary bytes
+// with no identity and no counter. A stub DeviceCheck.framework could never
+// have assembled an assertion out of that, because the counter is
+// devicecheckd's state and nothing outside it knows the current value —
+// inventing one desynchronises every other holder of the key and breaks a
+// relying party's counter-increased check.
 //
-// Needs the forge armed, unlike /sign: the rpIdHash baked into authData comes
-// from whatever caller identity devicecheckd resolves at call time.
+// Needs the forge armed: the rpIdHash baked into authData comes from
+// whatever caller identity devicecheckd resolves at call time.
 //
 // Same UB caveat as attest: `appId` must match the App ID the key was created
 // under.
@@ -407,9 +439,9 @@ static Resp handleAssertKey(NSString *keyId, NSDictionary *body) {
         return Err(400, @"bad_request", @"keyId required in path (from POST /keys)");
     if (![appId isKindOfClass:NSString.class])
         return Err(400, @"bad_request", @"appId required");
-    // Exactly 32 bytes, unlike /sign. generateAssertion's clientDataHash is a
-    // SHA-256 digest by contract (DCAppAttestService.h: "A SHA256 hash of a
-    // unique, single-use data block"), and devicecheckd composes the message
+    // Exactly 32 bytes. generateAssertion's clientDataHash is a SHA-256
+    // digest by contract (DCAppAttestService.h: "A SHA256 hash of a unique,
+    // single-use data block"), and devicecheckd composes the signed message
     // around it rather than signing it directly.
     if (cdh.length != 32)
         return Err(400, @"bad_request", @"clientDataHash must be 32 bytes (base64)");
@@ -433,51 +465,50 @@ static Resp handleAssertKey(NSString *keyId, NSDictionary *body) {
                     @"assertion": b64e(asrt)});
 }
 
-static Resp handleSignKey(NSString *key, NSDictionary *body) {
-    NSString *unknown = unknownFields(body, @[@"clientDataHash"]);
-    if (unknown)
-        return Err(400, @"unknown_field",
-                   [NSString stringWithFormat:@"POST /keys/{key}/sign does not "
-                    @"accept: %@", unknown]);
-    NSData *cdh = b64d(body[@"clientDataHash"]);
-    if (key.length == 0)
-        return Err(400, @"bad_request", @"key required in path (from GET /keys)");
-    // Arbitrary length, not just 32 bytes: the tweak's raw-label sign path
-    // (OracledHandleSignArbitraryKey) signs whatever bytes it is handed with
-    // the SEP key via kSecKeyAlgorithmECDSASignatureMessageX962SHA256 — the
-    // *Message* variant, which SHA-256s its input itself before signing. So a
-    // full App Attest assertion message (authData || clientDataHash,
-    // typically 69 bytes) handed in here yields a signature over
-    // SHA256(authData || clientDataHash), which is exactly the real assertion
-    // construction. The old 32-byte-only check was a web-layer assumption
-    // inherited from clientDataHash conventions, and was the only thing
-    // standing between this endpoint and assembling complete assertions
-    // client-side (counter managed by the caller). Upper bound is purely
-    // defensive; the HTTP body reader itself has no cap of its own.
-    if (cdh.length == 0 || cdh.length > 4096)
-        return Err(400, @"bad_request", @"clientDataHash must be 1..4096 bytes (base64)");
+// POST /keys/{key}/sign is GONE as of 0.3.0.
+//
+// It exposed the tweak's raw-label sign path
+// (OracledHandleSignArbitraryKey): a raw ECDSA signature over arbitrary
+// caller-supplied bytes with the SEP key, bypassing identity and the
+// counter. Its only real use was assembling an assertion client-side, and
+// POST /keys/{keyId}/assert now produces a genuine one with devicecheckd's
+// own counter, which is both correct and what a stub framework needs. A
+// lower-level primitive with no framework counterpart, no remaining caller,
+// and the power to sign anything with any resident key is not worth keeping
+// on the HTTP surface.
+//
+// The CAPABILITY still exists in Tweak.x — kOracledRawLabelSignPrefix and
+// its handler are untouched, and remain a documented finding (a compromised
+// devicecheckd can sign with any key on the device). Only the route is gone.
 
-    NSString *sentinelKeyId = [kOracledRawLabelSignPrefix stringByAppendingString:key];
-    NSError *err = nil;
-    NSData *sig = dcAssert(sentinelKeyId, cdh, &err);
-    if (!sig) return Err(502, @"sign_failed", fullErrorDump(err));
-    return R(200, @{@"key": key, @"signature": b64e(sig)});
-}
-
-static Resp handleDeleteKey(NSString *key) {
-    if (key.length == 0) return Err(400, @"bad_request", @"key required in path");
+static Resp handleDeleteLabel(NSString *label) {
+    if (label.length == 0) return Err(400, @"bad_request", @"label required in path");
+    // Reject anything that is not label-shaped BEFORE handing it to the
+    // tweak. Apple's delete is idempotent and returns true for "already
+    // gone", so without this check a keyId — or literal garbage — came back
+    // as 200 {"deleted": true} having removed nothing. Verified 2026-10-10:
+    // `DELETE /keys/totally-not-a-label` answered 200 deleted=true.
+    //
+    // Idempotency for a REAL label is deliberate and preserved (see below).
+    // "That was never a label" is a different thing: a caller error, and it
+    // now says so.
+    if (![label hasPrefix:kLabelPrefix])
+        return Err(400, @"bad_request",
+                   [NSString stringWithFormat:@"not a credential label (must start \"%@\"). "
+                    @"Labels come from GET /labels; a keyId from POST /keys is a "
+                    @"different identifier and cannot be used here.", kLabelPrefix]);
 
     // Ground truth (2026-09-08, live Frida call against a real label):
     // Apple's own delete returns TRUE for both "existed and was removed"
     // and "was already gone" (idempotent-delete semantics — see Tweak.x).
     // So the boolean alone decides 200 vs 500 here; there's no reliable way
     // to report 404 separately, and none is worth faking on top of it.
-    NSString *sentinelKeyId = [kOracledRawLabelDeletePrefix stringByAppendingString:key];
+    NSString *sentinelKeyId = [kOracledRawLabelDeletePrefix stringByAppendingString:label];
     NSData *dummyHash = [NSMutableData dataWithLength:32];
     NSError *err = nil;
     NSData *result = dcAssert(sentinelKeyId, dummyHash, &err);
     if (!result) return Err(500, @"delete_failed", fullErrorDump(err));
-    return R(200, @{@"key": key, @"deleted": @YES});
+    return R(200, @{@"label": label, @"deleted": @YES});
 }
 
 static Resp route(NSString *method, NSString *path, NSDictionary *body) {
@@ -496,33 +527,28 @@ static Resp route(NSString *method, NSString *path, NSDictionary *body) {
                         @"supportedEnvironments": @[@"development", @"production"],
                         @"environmentForgery": @YES});
     }
-    if ([path isEqualToString:@"/keys"] && [method isEqualToString:@"GET"])
-        return handleListKeys();
+    // ---- /keys : keyId-addressed, the public framework surface ----
+    //
+    // No GET. The framework has no enumeration verb; see the file header.
     if ([path isEqualToString:@"/keys"] && [method isEqualToString:@"POST"])
         return handleCreateKey(body);
-    if ([path hasPrefix:@"/keys/"] && [path hasSuffix:@"/sign"] && [method isEqualToString:@"POST"]) {
-        NSString *mid = [path substringWithRange:NSMakeRange(6, path.length - 6 - 5)];
-        return handleSignKey([mid stringByRemovingPercentEncoding], body);
-    }
-    // NOTE the path variable here is a keyId, while /keys/{key}/sign and
-    // DELETE /keys/{key} take an opaque keychain LABEL. Two identifier
-    // namespaces in the same path position, disambiguated only by the
-    // suffix. Routing is unambiguous (labels always start `aa:`), but it is a
-    // wart; resolving it properly means moving one of the two under its own
-    // prefix, which is an open contract decision.
     if ([path hasPrefix:@"/keys/"] && [path hasSuffix:@"/attest"] && [method isEqualToString:@"POST"]) {
         NSString *mid = [path substringWithRange:NSMakeRange(6, path.length - 6 - 7)];
         return handleAttestKey([mid stringByRemovingPercentEncoding], body);
     }
-    // Also keyId-addressed, same namespace caveat as /attest above.
     if ([path hasPrefix:@"/keys/"] && [path hasSuffix:@"/assert"] && [method isEqualToString:@"POST"]) {
         NSString *mid = [path substringWithRange:NSMakeRange(6, path.length - 6 - 7)];
         return handleAssertKey([mid stringByRemovingPercentEncoding], body);
     }
-    if ([path hasPrefix:@"/keys/"] && [method isEqualToString:@"DELETE"]) {
-        NSString *key = [path substringFromIndex:6];
-        return handleDeleteKey([key stringByRemovingPercentEncoding]);
+
+    // ---- /labels : label-addressed, the privileged device-wide surface ----
+    if ([path isEqualToString:@"/labels"] && [method isEqualToString:@"GET"])
+        return handleListLabels();
+    if ([path hasPrefix:@"/labels/"] && [method isEqualToString:@"DELETE"]) {
+        NSString *label = [path substringFromIndex:8];
+        return handleDeleteLabel([label stringByRemovingPercentEncoding]);
     }
+
     return Err(404, @"not_found", nil);
 }
 

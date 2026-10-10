@@ -44,7 +44,17 @@ servers:
 
 tags:
   - name: keys
-    description: List, mint, attest, sign with, and delete App Attest keys.
+    description: >-
+      keyId-addressed. The public DCAppAttestService surface — one route per
+      framework verb (generateKey, attestKey, generateAssertion). This is all
+      a stub DeviceCheck.framework forwards. There is no listing here, because
+      the framework has no enumeration verb.
+  - name: labels
+    description: >-
+      Label-addressed. The privileged device-wide keychain surface, which
+      exists only because devicecheckd is compromised and has no framework
+      counterpart at all. Reaches every App Attest credential on the device,
+      from every app.
 
 paths:
   /health:
@@ -89,43 +99,6 @@ paths:
         as "App Attest is unavailable here", which was simply false.
 
   /keys:
-    get:
-      operationId: listKeys
-      summary: List every App Attest key resident on the device.
-      description: |
-        Calls Apple's own `_getAllCredentialKeychainLabels` (AppAttestInternal,
-        resolved and called directly by address from inside the compromised
-        devicecheckd process) and returns every label found under the shared
-        `com.apple.appattest.identities` keychain service — one entry per
-        credential ever created by App Attest on this device, by any app, real
-        identity or forged, including ones this aaoracled instance itself
-        minted (there is no separate bookkeeping for those).
-
-        Keys are **opaque**: each label is built from SHA256 hashes of the
-        environment, per-installation app UUID, and team/bundle identifier
-        (`_buildKeychainLabel`, one-way), plus the raw credentialId and a
-        `p`/`d` environment-prefix character. There is no way to recover
-        which app a key belongs to from it alone — treat it as an opaque
-        handle, not identifying information.
-      tags: [keys]
-      responses:
-        "200":
-          description: Every key on the device.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  keys:
-                    type: array
-                    items: { $ref: "#/components/schemas/KeyEntry" }
-                required: [keys]
-        "502":
-          description: The devicecheckd-side enumeration call failed.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-
     post:
       operationId: createKey
       summary: Mint a new key for a given App ID (generateKey only).
@@ -155,7 +128,9 @@ paths:
         Nothing is stored. The key becomes addressable two ways, in two
         **different identifier namespaces**: by the `keyId` returned here
         (`POST /keys/{keyId}/attest`), and by its own opaque keychain label
-        (`GET /keys`, sign, delete). They are not interchangeable.
+        (`GET /labels`, `DELETE /labels/{label}`). They are not
+        interchangeable, and as of 0.3.0 they live under separate path
+        hierarchies so that confusing them fails loudly.
 
         No Apple network round trip happens here — key generation is local to
         the Secure Enclave. The CA round trip happens at attest time.
@@ -225,11 +200,8 @@ paths:
         Do not build on either outcome.
 
         > `{keyId}` here is the **keyId** from `POST /keys` — *not* the opaque
-        > keychain label used by `POST /keys/{key}/sign` and
-        > `DELETE /keys/{key}`. Two identifier namespaces occupy the same path
-        > position, disambiguated by the operation suffix. Labels always begin
-        > `aa:`, so routing is unambiguous, but do not pass one where the other
-        > is expected.
+        > keychain label that the `/labels` hierarchy uses. The two live under
+        > separate roots as of 0.3.0 precisely so they cannot be confused.
 
         This performs one Apple CA round trip and is rate-limit /
         `risk_metric` sensitive.
@@ -293,19 +265,20 @@ paths:
         the CBOR assertion object — `{signature, authenticatorData}` — that a
         relying party expects for every post-registration request.
 
-        **This is not `POST /keys/{key}/sign`.** Here devicecheckd builds
-        `authData` itself (the rpIdHash plus its own monotonically
-        incrementing counter for the key) and the Secure Enclave signs over
-        `authData || clientDataHash`. `/sign` is a deliberately lower-level
-        primitive: a raw ECDSA signature over whatever bytes the caller hands
-        it, bypassing identity and the counter entirely.
+        devicecheckd builds `authData` itself — the rpIdHash plus its own
+        monotonically incrementing counter for the key — and the Secure
+        Enclave signs over `authData || clientDataHash`. Verified on hardware
+        2026-10-10: three successive calls on one key reported counter 1, 2,
+        3, with a 37-byte `authData` carrying no AAGUID.
 
-        That difference is why this operation has to exist. A stub
-        `DeviceCheck.framework` cannot assemble an assertion out of `/sign`,
-        because the counter is devicecheckd's state and nothing outside it
-        knows the current value — inventing one desynchronises every other
-        holder of the key and breaks a relying party's counter-increased
-        check.
+        This replaced the raw-label sign route removed in 0.3.0, which
+        produced a bare ECDSA signature over arbitrary caller-supplied bytes
+        with no identity and no counter. A stub `DeviceCheck.framework` could
+        never have assembled an assertion out of that, because the counter is
+        devicecheckd's state and nothing outside it knows the current value —
+        inventing one desynchronises every other holder of the key and breaks
+        a relying party's counter-increased check. (The underlying capability
+        still exists in the tweak; only the HTTP route is gone.)
 
         The key must already be attested. Apple documents
         `DCErrorInvalidKey` for asserting with an unattested key.
@@ -355,87 +328,92 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
-  /keys/{key}/sign:
-    post:
-      operationId: signWithKey
-      summary: Sign a challenge with an arbitrary key.
+  /labels:
+    get:
+      operationId: listLabels
+      summary: List every App Attest credential resident on the device.
       description: |
-        Resolves `key` to a live `SecKeyRef` via Apple's own
-        `_copy_keychain_item` (same address-resolution technique as
-        `listKeys`) and signs `clientDataHash` directly with
-        `SecKeyCreateSignature` (`kSecKeyAlgorithmECDSASignatureMessageX962SHA256`).
+        Calls Apple's own `_getAllCredentialKeychainLabels` (AppAttestInternal,
+        resolved and called directly by address from inside the compromised
+        devicecheckd process) and returns every label found under the shared
+        `com.apple.appattest.identities` keychain service — one entry per
+        credential ever created by App Attest on this device, by any app, real
+        identity or forged, including ones this aaoracled instance itself
+        minted (there is no separate bookkeeping for those).
 
-        This returns a **raw ECDSA signature**, not an App Attest assertion —
-        there is no `authenticatorData`, no counter, and no CBOR wrapping,
-        because the normal `generateAssertion` bookkeeping (counter storage,
-        authenticator data construction) is keyed to a claimed app identity
-        this call never makes or needs. Works uniformly for any key `GET
-        /keys` lists, including ones this instance just minted.
-      tags: [keys]
-      parameters:
-        - name: key
-          in: path
-          required: true
-          description: |
-            A key exactly as returned by `GET /keys`, URL-encoded. Keys are
-            standard base64-derived and contain `:` plus, for most entries,
-            `+`/`/`/`=` — percent-encode the entire value before building the
-            URL (in particular, any `/` in the key MUST be encoded as `%2F`
-            or it will be parsed as a path separator).
-          schema: { type: string }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/SignRequest" }
+        Labels are **opaque**: each is built from SHA256 hashes of the
+        environment, per-installation app UUID, and team/bundle identifier
+        (`_buildKeychainLabel`, one-way), plus `SHA256(utf8(keyId))` and a
+        `p`/`d` environment character. The App ID is present only as its
+        hash, so there is no way to recover which app a credential belongs to
+        from a label alone — treat it as an opaque handle, not identifying
+        information.
+      tags: [labels]
       responses:
         "200":
-          description: Signature produced.
+          description: Every credential on the device.
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/SignResponse" }
-        "400":
-          $ref: "#/components/responses/BadRequest"
+              schema:
+                type: object
+                properties:
+                  labels:
+                    type: array
+                    items: { $ref: "#/components/schemas/LabelEntry" }
+                required: [labels]
         "502":
-          description: No keychain item exists for that key, or signing failed.
+          description: The devicecheckd-side enumeration call failed.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
-  /keys/{key}:
+  /labels/{label}:
     delete:
-      operationId: deleteKey
-      summary: Delete a key from the device.
+      operationId: deleteLabel
+      summary: Delete a credential from the device.
       description: |
         Calls Apple's own `_deleteCredentialKeychainWithLabel` (same
-        address-resolution technique as `listKeys`), which removes the
-        keychain item for `key`.
+        address-resolution technique as `listLabels`), removing the keychain
+        item for `label`.
 
         This call is **idempotent by Apple's own design, not aaoracled's**:
-        confirmed live (a real device, a real key) that the underlying
-        function returns success both when the key existed and was actually
+        confirmed live (a real device, a real credential) that the underlying
+        function returns success both when the item existed and was actually
         removed, and when it was already gone — Apple's own
         `_delete_keychain_item` treats `SecItemDelete`'s real success and
         `errSecItemNotFound` as equally successful outcomes. There is
-        therefore no reliable way to report "the key didn't exist" as a
-        distinct `404` here, and aaoracled does not fake one on top of it:
-        any `key` that isn't a genuine failure on Apple's side returns `200`
-        whether or not it was actually present beforehand.
-      tags: [keys]
+        therefore no reliable way to report "it didn't exist" as a distinct
+        `404`, and aaoracled does not fake one on top of it.
+
+        **A value that is not label-shaped is a `400`, not a success.** That
+        idempotency used to swallow caller errors too: before 0.3.0, passing a
+        `keyId` — or literal garbage — returned `200 {"deleted": true}` having
+        removed nothing (verified 2026-10-10). Labels always begin `aa:`, so
+        anything else is now rejected outright. Idempotency for a *real* label
+        is unchanged and deliberate; "that was never a label" is a different
+        condition and now says so.
+      tags: [labels]
       parameters:
-        - name: key
+        - name: label
           in: path
           required: true
-          description: >-
-            A key exactly as returned by `GET /keys`, URL-encoded (same
-            encoding rules as `POST /keys/{key}/sign`).
-          schema: { type: string }
+          description: |
+            A label exactly as returned by `GET /labels`, percent-encoded.
+            Labels contain `:` plus base64's `+`/`/`/`=` — encode the entire
+            value; in particular any `/` MUST become `%2F` or it will be
+            parsed as a path separator.
+
+            This is **not** a `keyId`. A `keyId` from `POST /keys` is a
+            different identifier and is rejected here with a `400`.
+          schema: { $ref: "#/components/schemas/Label" }
       responses:
         "200":
           description: Delete call succeeded (see idempotency note above).
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/DeleteKeyResponse" }
+              schema: { $ref: "#/components/schemas/DeleteLabelResponse" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "500":
           description: The underlying delete call genuinely failed.
           content:
@@ -493,15 +471,18 @@ components:
       contentEncoding: base64
       description: Standard base64-encoded bytes.
 
-    Key:
+    Label:
       type: string
+      pattern: '^aa:'
       description: >-
         Opaque credential-keychain label from AppAttestInternal's own
-        namespace, verbatim (including its `aa:` prefix) — see `GET /keys`.
+        namespace, verbatim (including its `aa:` prefix) — see `GET /labels`.
+        Always starts `aa:`, which is what lets a misdirected `keyId` be
+        rejected rather than silently accepted.
       examples:
         - "aa:9Ur1MdQmPZZbOLudX+0T2lAbouGfiPZH1GQOIRyp88Y=d:4VI0nln7iw2mu3QIYzOuKkK9973ltBVMr6Rra6VrfSU=:eoYNTZIaNEumvCYOW4JCGkUhl7iv/6HpXUuvbGt+Tk0=:rk"
 
-    KeyEntry:
+    LabelEntry:
       type: object
       description: |
         A resident credential plus the environment it was minted under.
@@ -510,12 +491,16 @@ components:
         the label as a single character right after the first base64
         component's `=` padding (`=d:` development, `=p:` production), so
         reading it costs nothing: no attestation, no network, no CA round
-        trip. That makes `GET /keys` the cheapest way to confirm an
-        `environment` override on `POST /keys` actually took effect.
+        trip. That makes `GET /labels` the cheapest way to confirm an
+        `environment` override on `POST /keys` actually took effect, and it is
+        how the attest and assert operations recover a key's environment
+        instead of asking the caller for it.
 
-        BREAKING vs 0.1.0: `keys` was an array of bare label strings.
+        BREAKING in 0.3.0: this moved from `GET /keys` to `GET /labels`, and
+        the per-entry field is now `label` rather than `key`. (In 0.1.0 the
+        array held bare label strings.)
       properties:
-        key: { $ref: "#/components/schemas/Key" }
+        label: { $ref: "#/components/schemas/Label" }
         environment:
           oneOf:
             - $ref: "#/components/schemas/Environment"
@@ -523,7 +508,7 @@ components:
           description: >-
             Null when the label does not match the known layout - reported as
             unknown rather than guessed.
-      required: [key, environment]
+      required: [label, environment]
 
     CreateKeyRequest:
       type: object
@@ -540,9 +525,9 @@ components:
           allOf: [{ $ref: "#/components/schemas/Base64" }]
           description: >-
             The credentialId App Attest assigned this key. Pass it back to
-            `POST /keys/{keyId}/attest`. NOT the same string as the opaque
-            label `GET /keys` returns for this same key — use that label, from
-            a subsequent listing, to sign or delete it. It is
+            `POST /keys/{keyId}/attest` and `/assert`. NOT the same string as
+            the opaque label `GET /labels` returns for this same key — use
+            that label to delete it. It is
             `base64(SHA256(uncompressed public key point))`, so it is derived
             from the key rather than assigned arbitrarily.
         appId: { $ref: "#/components/schemas/AppId" }
@@ -608,8 +593,7 @@ components:
             Exactly 32 bytes — a SHA-256 digest, per
             `DCAppAttestService.h` ("A SHA256 hash of a unique, single-use
             data block"). devicecheckd composes the signed message around it
-            rather than signing it directly, which is why this is fixed-length
-            where `POST /keys/{key}/sign` accepts 1..4096.
+            rather than signing it directly.
       required: [appId, clientDataHash]
 
     AssertResponse:
@@ -628,43 +612,14 @@ components:
             `authenticatorData`.
       required: [keyId, appId, environment, assertion]
 
-    SignRequest:
-      type: object
-      additionalProperties: false
-      properties:
-        clientDataHash:
-          allOf: [{ $ref: "#/components/schemas/Base64" }]
-          description: >-
-            Arbitrary bytes to sign directly (no App Attest semantics),
-            1..4096 bytes. Historically required to be exactly 32 bytes; the
-            tweak's raw-label sign path signs arbitrary input with the SEP key
-            using the ECDSA *message* algorithm (which hashes its input before
-            signing), so the cap is lifted. A full assertion message
-            (`authData || clientDataHash`, typically 69 bytes) can therefore be
-            signed here to assemble a complete assertion client-side — the
-            32-byte-only form could only ever produce a signature over
-            `SHA256(clientDataHash)`, which is not the assertion construction.
-      required: [clientDataHash]
-
-    SignResponse:
+    DeleteLabelResponse:
       type: object
       properties:
-        key: { $ref: "#/components/schemas/Key" }
-        signature:
-          allOf: [{ $ref: "#/components/schemas/Base64" }]
-          description: >-
-            Raw DER-encoded ECDSA signature over `clientDataHash` — NOT a CBOR
-            App Attest assertion. See the endpoint description.
-      required: [key, signature]
-
-    DeleteKeyResponse:
-      type: object
-      properties:
-        key: { $ref: "#/components/schemas/Key" }
+        label: { $ref: "#/components/schemas/Label" }
         deleted:
           type: boolean
           const: true
-      required: [key, deleted]
+      required: [label, deleted]
 
     Error:
       type: object
