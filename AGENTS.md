@@ -61,8 +61,33 @@ SDK headers and `.tbd` (see "Reading the DeviceCheck SDK surface" below):
 | `-generateKeyWithCompletionHandler:` | `POST /keys` | done (0.3.0) |
 | `-attestKey:clientDataHash:completionHandler:` | `POST /keys/{keyId}/attest` | done (0.3.0) |
 | `-generateAssertion:clientDataHash:completionHandler:` | `POST /keys/{keyId}/assert` | done (0.3.0) |
-| `DCDevice -generateTokenWithCompletionHandler:` | not App Attest | undecided |
+| `DCDevice -generateTokenWithCompletionHandler:` | **nothing, deliberately** | won't do |
 | `DCErrorDomain` + its five codes | a documented error mapping | outstanding |
+
+`DCDevice` ships in the same framework binary as `DCAppAttestService` and
+shares `DCErrorDomain`, but shares no mechanism with it: it is two bits of
+Apple-hosted per-device storage (the "already used the free trial"
+primitive), with no SEP key, no attestation and no certificate.
+
+It is not implemented because **the client is only a courier**. The token is
+an opaque single-use bearer credential; the app hands it to the relying
+party's server, that server combines it with an Apple-issued authentication
+key, and Apple returns the bit values *directly to the server*. The client
+never reads, sets or asserts the bits.
+
+That is structurally the inverse of this project's finding. App Attest hands
+the client a signed artifact whose App-ID binding is derived in AP userspace
+— forgeable here. DeviceCheck keeps the authoritative value at Apple and
+delivers it out of band, so a compromised AP has essentially no leverage:
+there is no client-side claim worth forging. A forged App ID would at most
+produce a token under another team's identity, inert without that team's
+Apple-issued key, and it would not change which device the token identifies.
+Defeating a DeviceCheck bit check means using a *different device*, which
+needs no compromise at all.
+
+So an endpoint would emit a blob this project cannot validate and would
+demonstrate nothing. If you are tempted to add it, have a reason that
+survives the paragraph above.
 
 `isSupported` is not exposed and should not be. It answers for the *calling*
 process, and `aaoracled` is a bare binary with no installed app bundle, so

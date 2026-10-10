@@ -34,6 +34,40 @@ info:
     Attestations are inspected
     only by a relying-party harness Parker controls — never sent to a third party.
 
+    ## `DCDevice` is deliberately not implemented
+
+    `DeviceCheck.framework` exports two public classes, and this contract
+    covers only one of them. `DCDevice`
+    (`-generateTokenWithCompletionHandler:`, `API_AVAILABLE(ios(11.0))`) has
+    **no endpoint here and is not planned**, even though a stub framework
+    built against this API would have to answer it. The omission is a
+    judgement about what this tool can meaningfully demonstrate, not an
+    oversight.
+
+    `DCDevice` is two bits of Apple-hosted per-device storage — the
+    "has this device already used its free trial" primitive. It involves no
+    Secure Enclave key, no attestation and no certificate. The token it
+    produces is an opaque, single-use **bearer credential**: the app sends it
+    to the relying party's server, that server combines it with an
+    Apple-issued authentication key, and **Apple returns the bit values
+    directly to the server**. The client never reads the bits, never sets
+    them, and never asserts them.
+
+    That is the opposite of the weakness this tool exists to demonstrate. App
+    Attest hands the client a signed artifact whose App-ID binding is derived
+    by application-processor userspace, and that derivation is forgeable here.
+    DeviceCheck keeps the authoritative value at Apple and delivers it
+    out-of-band to the server, so a fully compromised AP has almost no
+    leverage: there is no client-side claim worth forging. A forged App ID
+    would at most yield a token under another team's identity, which is inert
+    without that team's Apple-issued key, and it would not change the device
+    the token identifies.
+
+    So an endpoint here would emit an opaque blob this project has no path to
+    validate, and would demonstrate nothing. A stub that needs `DCDevice` can
+    add it; this contract records why it is absent instead of implying the
+    gap is unexamined.
+
 servers:
   - url: http://127.0.0.1:8181
     description: |
