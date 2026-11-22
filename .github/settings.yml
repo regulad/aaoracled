@@ -6,10 +6,8 @@ _extends: .github
 repository:
   name: aaoracled
   description: >-
-    Research tool demonstrating that Apple App Attest provides no
-    jailbreak/tamper detection and no device-model binding: a headless
-    attestation-and-assertion oracle daemon on a jailbroken iOS device,
-    driving DCAppAttestService directly outside any UI flow.
+    Shows Apple App Attest has no tamper detection or device binding: an
+    attestation oracle daemon for jailbroken iOS
   homepage: ""
   private: false
   # Topics: comma-and-space separated string, NOT a YAML list.
