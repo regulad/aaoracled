@@ -439,10 +439,8 @@ SDK — no device, no disassembly. On the WSL instance `regulad-fedora`:
 /home/regulad.linux/theos/sdks/iPhoneOS16.5.sdk/System/Library/Frameworks/DeviceCheck.framework
 ```
 
-Two mechanical gotchas: `$THEOS` is not exported in a non-interactive shell,
-and PowerShell mangles nested quotes passed through
-`wsl -d regulad-fedora -- bash -lc`. Use absolute paths with no shell
-variables.
+One mechanical gotcha: `$THEOS` is not exported in a non-interactive shell,
+so use absolute paths with no shell variables.
 
 The SDK ships `.tbd` stubs and headers, **not** Mach-O binaries — there is
 nothing there to disassemble, and nothing needs to be:
